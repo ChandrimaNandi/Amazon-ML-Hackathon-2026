@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environments
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & Large Files
+dataset/
+*.tsv
+*.zip
+
+# Generated Output
+output/
+
+# OS
+.DS_Store
