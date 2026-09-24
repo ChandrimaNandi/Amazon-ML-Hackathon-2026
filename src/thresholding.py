@@ -1,5 +1,6 @@
 """
 Threshold Optimization & Decision Rule Module for Business Entity Resolution.
+Refined for precise Macro F0.5 probability threshold sweeps.
 """
 
 import numpy as np
@@ -35,7 +36,6 @@ def apply_decision_rules(
         
     # Group candidates by query_id
     for q_id, group in cand_df_with_probs.groupby("query_id"):
-        # Sort candidates descending by predicted probability score
         sorted_cands = group.sort_values("pred_score", ascending=False)
         
         selected_s1_ids = set()
@@ -44,7 +44,10 @@ def apply_decision_rules(
         agree_counts = sorted_cands["retrieval_agreement_count"].values
         s1_ids = sorted_cands["s1_id"].values
         
-        top1_score = scores[0] if len(scores) > 0 else 0.0
+        if len(scores) == 0:
+            continue
+            
+        top1_score = scores[0]
         top2_score = scores[1] if len(scores) > 1 else 0.0
         margin = top1_score - top2_score
         
@@ -53,17 +56,21 @@ def apply_decision_rules(
             ag = agree_counts[idx]
             s1_id = s1_ids[idx]
             
-            # Acceptance conditions
-            if sc >= abs_threshold and ag >= min_agreement_count:
-                # If top candidate, check margin unless score is extremely high (e.g. >= 0.85)
-                if idx == 0:
-                    if sc >= 0.85 or margin >= margin_threshold or len(scores) == 1:
-                        selected_s1_ids.add(s1_id)
-                else:
-                    # Multi-match candidate: must also satisfy threshold
-                    if sc >= abs_threshold + 0.1:
-                        selected_s1_ids.add(s1_id)
-                        
+            # 1. Absolute probability threshold check
+            if sc < abs_threshold or ag < min_agreement_count:
+                continue
+                
+            # 2. Top-1 candidate margin check
+            if idx == 0:
+                if margin_threshold > 0 and len(scores) > 1:
+                    if margin < margin_threshold:
+                        continue
+                selected_s1_ids.add(s1_id)
+            else:
+                # Multi-match candidates require higher score buffer
+                if sc >= abs_threshold + 0.10:
+                    selected_s1_ids.add(s1_id)
+                    
         for s1_id in selected_s1_ids:
             s1_to_predicted.setdefault(s1_id, set()).add(q_id)
             
