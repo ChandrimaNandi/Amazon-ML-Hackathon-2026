@@ -66,7 +66,7 @@ class EntityMatcherModel:
         probs = self.model.predict_proba(X)[:, 1]
         return probs
 
-    def get_feature_importances(() -> pd.DataFrame:
+    def get_feature_importances(self) -> pd.DataFrame:
         """Returns DataFrame of feature importances."""
         if self.model is None:
             return pd.DataFrame()
