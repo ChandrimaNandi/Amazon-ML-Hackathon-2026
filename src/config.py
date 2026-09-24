@@ -1,5 +1,6 @@
 """
 Centralized Configuration for Business Entity Resolution Pipeline.
+Auto-detects local directory vs Kaggle dataset environment.
 """
 
 import os
@@ -7,15 +8,39 @@ from pathlib import Path
 
 # Base Paths
 PROJECT_ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-DATASET_DIR = PROJECT_ROOT / "dataset"
+
+# Auto-detect Kaggle Dataset Paths
+KAGGLE_DATASET_CANDIDATE = Path("/kaggle/input/entity-data/dataset")
+
+if KAGGLE_DATASET_CANDIDATE.exists():
+    DATASET_DIR = KAGGLE_DATASET_CANDIDATE
+    OUTPUT_DIR = Path("/kaggle/working/output")
+    RESULTS_DIR = Path("/kaggle/working/results")
+    LOGS_DIR = Path("/kaggle/working/logs")
+elif Path("/kaggle/input").exists():
+    # Dynamic search under /kaggle/input if dataset name differs
+    found_dataset = None
+    for root, dirs, files in os.walk("/kaggle/input"):
+        if "train" in dirs and "test" in dirs:
+            found_dataset = Path(root)
+            break
+    if found_dataset:
+        DATASET_DIR = found_dataset
+    else:
+        DATASET_DIR = PROJECT_ROOT / "dataset"
+    OUTPUT_DIR = Path("/kaggle/working/output")
+    RESULTS_DIR = Path("/kaggle/working/results")
+    LOGS_DIR = Path("/kaggle/working/logs")
+else:
+    DATASET_DIR = PROJECT_ROOT / "dataset"
+    OUTPUT_DIR = PROJECT_ROOT / "output"
+    RESULTS_DIR = PROJECT_ROOT / "results"
+    LOGS_DIR = PROJECT_ROOT / "logs"
+
 TRAIN_DIR = DATASET_DIR / "train"
 TEST_DIR = DATASET_DIR / "test"
 
-OUTPUT_DIR = PROJECT_ROOT / "output"
-RESULTS_DIR = PROJECT_ROOT / "results"
-LOGS_DIR = PROJECT_ROOT / "logs"
-
-# Ensure directories exist
+# Ensure output directories exist
 for p in [OUTPUT_DIR, RESULTS_DIR, LOGS_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
