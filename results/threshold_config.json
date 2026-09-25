@@ -1,0 +1,8 @@
+{
+  "abs_threshold": 0.5,
+  "margin_threshold": 0.0,
+  "beta": 0.5,
+  "metrics": {
+    "val_macro_f0.5": 0.0542
+  }
+}

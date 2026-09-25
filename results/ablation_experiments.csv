@@ -1,0 +1,11 @@
+Experiment,Num Features,Candidate Recall,Precision,Recall,F0.5,Predicted Matches,Runtime (s)
+1. Exact matching only,5,1.0,0.0526,0.0526,0.0526,0,0.03
+2. Name similarity only,11,1.0,0.052,0.0511,0.0515,126,0.58
+3. Address similarity only,11,1.0,0.0536,0.052,0.0528,243,0.76
+4. Name + address,22,1.0,0.0548,0.0534,0.0541,32,0.76
+5. + country,25,1.0,0.0546,0.0532,0.0539,32,0.54
+6. + script,27,1.0,0.0548,0.0534,0.0541,32,0.58
+7. + retrieval agreement,30,1.0,0.0542,0.0528,0.0535,39,0.74
+8. + BM25,36,1.0,0.0544,0.053,0.0537,42,0.64
+9. + TF-IDF,42,1.0,0.054,0.0526,0.0533,44,0.72
+10. Full model,57,1.0,0.055,0.0534,0.0542,35,0.56

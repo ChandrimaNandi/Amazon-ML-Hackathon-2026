@@ -68,9 +68,10 @@ def load_ground_truth(path: Path) -> Tuple[pd.DataFrame, Dict[str, Set[str]], Di
     s1_to_matches: Dict[str, Set[str]] = {}
     match_to_s1: Dict[str, str] = {}
     
-    for _, row in gt_df.iterrows():
-        s1_id = row["source1_entity_id"].strip()
-        matches_str = row["matched_entity_ids"].strip()
+    s1_col = gt_df["source1_entity_id"].astype(str).str.strip()
+    match_col = gt_df["matched_entity_ids"].astype(str).str.strip()
+    
+    for s1_id, matches_str in zip(s1_col, match_col):
         if matches_str:
             matched_set = set(m.strip() for m in matches_str.split(",") if m.strip())
         else:

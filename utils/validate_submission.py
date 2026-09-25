@@ -278,13 +278,18 @@ def main():
     )
     parser.add_argument(
         "--matching",
+        "--predictions",
         "-m",
+        "-p",
+        dest="matching",
         default="output/matching_results.tsv",
-        help="Path to matching_results.tsv (default: %(default)s)",
+        help="Path to matching_results.tsv / predictions.tsv (default: %(default)s)",
     )
     parser.add_argument(
         "--candidate",
+        "--candidate-pairs",
         "-c",
+        dest="candidate",
         default=None,
         help="Path to candidate_pairs.tsv "
         "(default: output/candidate_pairs.tsv if it exists).",

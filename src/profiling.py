@@ -16,7 +16,7 @@ def detect_script(text: str) -> str:
     Classifies a string into Unicode script category based on non-ASCII characters or primary block.
     Returns one of: 'Latin', 'Devanagari', 'Arabic', 'Cyrillic', 'CJK', 'Greek', 'Hebrew', 'Other', 'Mixed'.
     """
-    if not text:
+    if not text or not isinstance(text, str):
         return "Empty"
     
     script_counts = {

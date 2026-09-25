@@ -1,5 +1,5 @@
 """
-Script to evaluate matching pipeline and calculate Macro F0.5.
+Script to evaluate matching pipeline, run threshold optimization, ablation suite, and error analysis.
 Run from project root: python3 scripts/evaluate.py
 """
 
@@ -15,78 +15,133 @@ from src.config import (
 )
 from src.data_loader import load_source_tsv, load_ground_truth
 from src.normalization import create_normalized_features
-from src.candidate_generation import generate_candidate_union
+from src.candidate_generation import CandidateGenerator
 from src.features import extract_candidate_features
+from src.negative_sampling import build_controlled_training_pairs
 from src.ranking import EntityMatcherModel
-from src.thresholding import apply_decision_rules
-from src.singleton import analyze_singleton_performance
-from src.evaluation import evaluate_macro_metrics
+from src.thresholding import optimize_threshold_grid, apply_decision_rules
+from src.evaluation import evaluate_macro_metrics, evaluate_candidate_recall_diagnostics, generate_error_analysis
+from src.experiments import create_entity_level_split, run_ablation_experiments
 
 
 def main():
     print("=" * 60)
-    print("[EVALUATE] Running Validation Framework on Train Dataset")
+    print("[EVALUATE] Running Leakage-Free Validation & Ablation Pipeline")
     print("=" * 60)
     
-    s1_df = load_source_tsv(TRAIN_S1_PATH)
-    s2_df = load_source_tsv(TRAIN_S2_PATH)
-    s3_df = load_source_tsv(TRAIN_S3_PATH)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # 1. Load data
+    s1_df = pd.read_csv(TRAIN_S1_PATH, sep="\t", nrows=25000, keep_default_na=False, dtype=str)
     gt_df, s1_to_matches, _ = load_ground_truth(TRAIN_GROUND_TRUTH_PATH)
     
-    # Use a representative sample for fast validation evaluation
-    query_df = pd.concat([s2_df, s3_df], ignore_index=True)
-    if len(query_df) > 30000:
-        query_df = query_df.sample(n=30000, random_state=42).reset_index(drop=True)
-        print(f"Evaluated on sample of {len(query_df):,} query records.")
+    s1_sample_ids = set(s1_df["entity_id"])
+    active_gt = {s1: s1_to_matches.get(s1, set()) for s1 in s1_sample_ids}
+    needed_q_ids = set()
+    for q_set in active_gt.values():
+        needed_q_ids.update(q_set)
         
+    s2_df = pd.read_csv(TRAIN_S2_PATH, sep="\t", nrows=20000, keep_default_na=False, dtype=str)
+    s3_df = pd.read_csv(TRAIN_S3_PATH, sep="\t", nrows=20000, keep_default_na=False, dtype=str)
+    query_df = pd.concat([s2_df, s3_df], ignore_index=True)
+    query_df = query_df[query_df["entity_id"].isin(needed_q_ids) | (query_df.index < 10000)].head(10000).reset_index(drop=True)
+    
+    # 2. Normalize
     s1_df = create_normalized_features(s1_df)
     query_df = create_normalized_features(query_df)
     
-    cand_df, stats = generate_candidate_union(s1_df, query_df, k_name=20, k_address=15)
-    feat_df = extract_candidate_features(cand_df, s1_df, query_df, s1_to_matches)
+    # 3. Entity-level split
+    train_s1, val_s1, train_q, val_q, train_gt, val_gt = create_entity_level_split(
+        s1_df, query_df, active_gt, val_ratio=0.20, random_seed=42
+    )
     
+    # 4. Candidate generation on train and val separately
+    gen_train = CandidateGenerator()
+    gen_train.fit(train_s1)
+    train_cands, _ = gen_train.generate_candidates(train_q)
+    
+    gen_val = CandidateGenerator()
+    gen_val.fit(val_s1)
+    val_cands, _ = gen_val.generate_candidates(val_q)
+    
+    # Recall diagnostics
+    val_recall_stats = evaluate_candidate_recall_diagnostics(val_cands, val_gt)
+    
+    # 5. Feature extraction
+    train_feat = extract_candidate_features(train_cands, train_s1, train_q, train_gt)
+    val_feat = extract_candidate_features(val_cands, val_s1, val_q, val_gt)
+    
+    # 6. Negative sampling on train
+    balanced_train, _ = build_controlled_training_pairs(train_feat, max_negatives_per_positive=8)
+    
+    # 7. Model training
     model = EntityMatcherModel()
-    model.fit(feat_df)
+    model.fit(balanced_train, val_df=val_feat)
     
-    probs = model.predict_proba(feat_df)
-    feat_df["pred_score"] = probs
+    # 8. Score validation candidates
+    val_feat["pred_score"] = model.predict_proba(val_feat)
     
-    s1_to_pred_matches = apply_decision_rules(feat_df, abs_threshold=0.50, margin_threshold=0.05)
+    # 9. Threshold optimization sweep strictly on validation set
+    val_s1_ids = set(val_s1["entity_id"])
+    opt_results = optimize_threshold_grid(
+        val_cand_df_with_probs=val_feat,
+        val_s1_ids=val_s1_ids,
+        s1_to_true_matches=val_gt
+    )
     
-    all_s1_ids = set(s1_df["entity_id"])
-    metrics = evaluate_macro_metrics(all_s1_ids, s1_to_matches, s1_to_pred_matches)
-    singleton_stats = analyze_singleton_performance(all_s1_ids, s1_to_matches, s1_to_pred_matches)
+    best_thresh = opt_results["best_threshold"]
+    best_margin = opt_results["best_margin"]
+    best_f05 = opt_results["best_macro_f0.5"]
     
     print("\n" + "=" * 60)
-    print("VALIDATION METRICS SUMMARY")
+    print("OPTIMAL VALIDATION THRESHOLD & METRICS")
     print("=" * 60)
-    for k, v in metrics.items():
-        print(f"  {k}: {v}")
-    print("\nSingleton & Match Breakdown:")
-    for k, v in singleton_stats.items():
-        print(f"  {k}: {v}")
-        
-    # Log to results/metrics.csv and results/experiments.csv
-    m_csv = RESULTS_DIR / "metrics.csv"
-    pd.DataFrame([metrics]).to_csv(m_csv, index=False)
+    print(f"  Best Threshold: {best_thresh:.2f}")
+    print(f"  Best Margin:    {best_margin:.2f}")
+    print(f"  Macro F0.5:     {best_f05:.4f}")
+    print(f"  Macro Precision:{opt_results['best_precision']:.4f}")
+    print(f"  Macro Recall:   {opt_results['best_recall']:.4f}")
     
-    exp_csv = RESULTS_DIR / "experiments.csv"
-    exp_row = {
-        "experiment": "LightGBM Baseline + BM25/Char-TFIDF Union",
-        "candidate_method": "BM25+CharTFIDF",
-        "macro_precision": metrics["macro_precision"],
-        "macro_recall": metrics["macro_recall"],
-        "macro_f0_5": metrics["macro_f0.5"],
-        "zero_match_accuracy_pct": singleton_stats["zero_match_accuracy_pct"],
+    # 10. Run 10-stage ablation suite
+    ablation_df = run_ablation_experiments(
+        train_feat_df=balanced_train,
+        val_feat_df=val_feat,
+        val_s1_ids=val_s1_ids,
+        s1_to_val_matches=val_gt,
+        abs_threshold=best_thresh,
+        margin_threshold=best_margin
+    )
+    print("\nAblation Experiment Results:")
+    print(ablation_df.to_string(index=False))
+    ablation_df.to_csv(RESULTS_DIR / "ablation_experiments.csv", index=False)
+    
+    # 11. Error Analysis
+    val_preds = apply_decision_rules(val_feat, abs_threshold=best_thresh, margin_threshold=best_margin)
+    fn_df, fp_df, err_summary = generate_error_analysis(
+        val_cand_feat_df=val_feat,
+        s1_df=val_s1,
+        query_df=val_q,
+        s1_to_true_matches=val_gt,
+        s1_to_pred_matches=val_preds,
+        output_path=RESULTS_DIR / "validation_error_analysis.csv"
+    )
+    
+    # Save final validation metrics
+    metrics_summary = {
+        "best_threshold": best_thresh,
+        "best_margin": best_margin,
+        "macro_f0.5": best_f05,
+        "macro_precision": opt_results["best_precision"],
+        "macro_recall": opt_results["best_recall"],
+        "candidate_recall_union": val_recall_stats.get("candidate_recall_union", 0.0),
+        "false_positives": err_summary["total_false_positives"],
+        "false_negatives": err_summary["total_false_negatives"],
+        "candidate_generation_failures": err_summary["candidate_generation_failures"],
+        "matcher_threshold_failures": err_summary["matcher_threshold_failures"]
     }
-    exp_df = pd.DataFrame([exp_row])
-    if exp_csv.exists():
-        exp_df.to_csv(exp_csv, mode="a", header=False, index=False)
-    else:
-        exp_df.to_csv(exp_csv, index=False)
-        
-    print(f"\nSaved metrics to {m_csv} and logged experiment to {exp_csv}")
-    print("\n[DONE] Evaluation Complete.")
+    pd.DataFrame([metrics_summary]).to_csv(RESULTS_DIR / "metrics.csv", index=False)
+    print(f"\nSaved metrics to {RESULTS_DIR / 'metrics.csv'}")
+    print("\n[DONE] Leakage-Free Validation & Evaluation Complete.")
 
 
 if __name__ == "__main__":

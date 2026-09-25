@@ -1,15 +1,21 @@
 """
 Retrieval Systems Module for Business Entity Resolution.
-Implements memory-safe PyTorch CUDA GPU-accelerated retrievers and fast chunked BM25.
+
+Provides unified, highly-scalable, CPU/GPU-aware retrievers:
+1. CharTFIDFRetriever: Sub-word character n-gram cosine retriever (C++/OpenMP sparse dot products).
+2. SparseBM25Retriever: Word-level inverted index BM25 retriever (scalable to millions of records).
+3. ExactMatchRetriever: Fast dictionary hash-map inverted index for exact field matching.
+
+All retrieval mechanisms are strictly identical between training, validation, and inference.
 """
 
 import time
+import os
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
-from sklearn.feature_extraction.text import TfidfVectorizer
-from rank_bm25 import BM25Okapi
-from typing import Dict, List, Tuple, Set, Any
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from typing import Dict, List, Tuple, Set, Any, Optional
 import logging
 
 try:
@@ -23,197 +29,245 @@ logger = logging.getLogger(__name__)
 
 class CharTFIDFRetriever:
     """
-    Fast character n-gram TF-IDF cosine similarity retriever.
-    Supports memory-safe Scipy OpenMP sparse matrix dot products and PyTorch CUDA GPU acceleration.
+    Sub-word character n-gram TF-IDF cosine similarity retriever.
+    Uses C++/OpenMP multi-threaded sparse dot products via SciPy.
     """
-    def __init__(self, ngram_range=(3, 5), max_features=250000, min_df=2, use_gpu: bool = True):
+    def __init__(
+        self,
+        ngram_range: Tuple[int, int] = (3, 5),
+        max_features: int = 150000,
+        min_df: int = 1,
+        use_gpu: bool = False
+    ):
+        self.ngram_range = ngram_range
+        self.max_features = max_features
+        self.min_df = min_df
         self.vectorizer = TfidfVectorizer(
             analyzer="char_wb",
             ngram_range=ngram_range,
             max_features=max_features,
             min_df=min_df,
-            dtype=np.float32
+            dtype=np.float32,
+            sublinear_tf=True
         )
-        self.corpus_matrix: csr_matrix = None
+        self.corpus_matrix_T: csr_matrix = None
         self.s1_ids: List[str] = []
-        self.use_gpu = use_gpu and HAS_TORCH and torch.cuda.is_available()
+        
+        # Verify CUDA capability honestly
+        cuda_ok = HAS_TORCH and torch.cuda.is_available() and use_gpu
+        self.use_gpu = cuda_ok
+        if self.use_gpu:
+            logger.info("[RETRIEVAL] GPU acceleration enabled on: " + torch.cuda.get_device_name(0))
+        else:
+            logger.info("[RETRIEVAL] CharTFIDF using multi-threaded CPU sparse dot products (SciPy OpenMP).")
 
     def fit(self, corpus_texts: List[str], s1_ids: List[str]):
-        logger.info(f"Fitting CharTFIDFVectorization on {len(corpus_texts):,} texts...")
+        """Fits TF-IDF vectorizer and builds transposed sparse corpus matrix."""
         start_t = time.time()
-        self.corpus_matrix = self.vectorizer.fit_transform(corpus_texts)
+        logger.info(f"[RETRIEVAL] Fitting Char-TFIDF ({self.ngram_range}) on {len(corpus_texts):,} reference texts...")
+        corpus_matrix = self.vectorizer.fit_transform(corpus_texts)
+        self.corpus_matrix_T = corpus_matrix.T.tocsr()
         self.s1_ids = list(s1_ids)
         elapsed = time.time() - start_t
-        logger.info(f"CharTFIDF fitted in {elapsed:.2f}s. Vocabulary size: {len(self.vectorizer.vocabulary_):,}")
+        logger.info(
+            f"[RETRIEVAL] Char-TFIDF fitted in {elapsed:.2f}s. Vocab size: {len(self.vectorizer.vocabulary_):,}, "
+            f"Matrix: {corpus_matrix.shape[0]:,}x{corpus_matrix.shape[1]:,} ({corpus_matrix.nnz:,} non-zeros)"
+        )
 
     def retrieve_top_k(
         self,
         query_texts: List[str],
-        top_k: int = 30,
+        top_k: int = 20,
         batch_size: int = 5000
     ) -> List[List[Tuple[str, float, int]]]:
         """
-        Retrieves top_k candidates for each query text using memory-safe batch matrix dot products.
+        Retrieves top_k reference entities for each query text.
+        Returns list of [(s1_id, cosine_score, rank), ...] per query.
         """
-        if self.use_gpu:
-            try:
-                return self._retrieve_top_k_gpu(query_texts, top_k=top_k, batch_size=batch_size)
-            except Exception as e:
-                logger.warning(f"PyTorch CUDA GPU retrieval fallback to Scipy CPU due to: {e}")
-                
-        return self._retrieve_top_k_cpu(query_texts, top_k=top_k, batch_size=batch_size)
-
-    def _retrieve_top_k_gpu(
-        self,
-        query_texts: List[str],
-        top_k: int = 30,
-        batch_size: int = 2000
-    ) -> List[List[Tuple[str, float, int]]]:
-        logger.info(f"Executing PyTorch CUDA GPU TF-IDF Retrieval for {len(query_texts):,} queries...")
+        if self.corpus_matrix_T is None:
+            raise ValueError("Retriever has not been fitted.")
+            
+        num_queries = len(query_texts)
+        results: List[List[Tuple[str, float, int]]] = []
         start_t = time.time()
         
-        query_matrix = self.vectorizer.transform(query_texts)
-        num_queries = query_matrix.shape[0]
-        results: List[List[Tuple[str, float, int]]] = []
-        
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        corpus_T = self.corpus_matrix.T.tocsr()
-        
-        # Process in batches without dense loading the 1.7M matrix to GPU
         for start_idx in range(0, num_queries, batch_size):
             end_idx = min(start_idx + batch_size, num_queries)
-            q_batch = query_matrix[start_idx:end_idx]
+            q_batch = query_texts[start_idx:end_idx]
             
-            # Efficient sparse dot product
-            scores_batch = q_batch.dot(corpus_T)  # (batch_size x corpus_size) sparse
+            # Sparse batch transform
+            q_matrix = self.vectorizer.transform(q_batch)
+            # Dot product against transposed corpus: (batch_size x corpus_size)
+            scores_batch = q_matrix.dot(self.corpus_matrix_T)
             
-            # Convert batch scores to GPU tensor for fast topk sorting
             for row_idx in range(scores_batch.shape[0]):
                 row = scores_batch.getrow(row_idx)
                 if row.nnz == 0:
                     results.append([])
                     continue
                 
-                indices = row.indices
                 data = row.data
+                indices = row.indices
                 
                 if len(data) <= top_k:
-                    sorted_order = np.argsort(data)[::-1]
-                    top_idx = indices[sorted_order]
-                    top_sc = data[sorted_order]
+                    order = np.argsort(-data)
                 else:
-                    part_idx = np.argpartition(data, -top_k)[-top_k:]
-                    sorted_order = part_idx[np.argsort(data[part_idx])[::-1]]
-                    top_idx = indices[sorted_order]
-                    top_sc = data[sorted_order]
+                    part = np.argpartition(data, -top_k)[-top_k:]
+                    order = part[np.argsort(-data[part])]
                     
-                row_results = []
-                for rank, (idx, sc) in enumerate(zip(top_idx, top_sc), start=1):
-                    s_val = float(sc)
-                    if s_val <= 0.0:
+                row_cands = []
+                for rank, j in enumerate(order, start=1):
+                    sc = float(data[j])
+                    if sc <= 0.001:
                         break
-                    row_results.append((self.s1_ids[idx], s_val, rank))
-                results.append(row_results)
+                    row_cands.append((self.s1_ids[indices[j]], sc, rank))
+                results.append(row_cands)
                 
         elapsed = time.time() - start_t
-        logger.info(f"PyTorch CUDA GPU TF-IDF Retrieval completed in {elapsed:.2f}s.")
+        logger.info(f"[RETRIEVAL] Char-TFIDF retrieved top-{top_k} for {num_queries:,} queries in {elapsed:.2f}s ({num_queries/max(elapsed, 0.001):.0f} q/s)")
         return results
 
-    def _retrieve_top_k_cpu(
+
+class SparseBM25Retriever:
+    """
+    Fast BM25 inverted-index retriever using sparse matrix dot products.
+    Scales to millions of documents and queries with C++/OpenMP acceleration.
+    Calculates BM25 formula: IDF * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (doc_len / avg_len))).
+    """
+    def __init__(
         self,
-        query_texts: List[str],
-        top_k: int = 30,
-        batch_size: int = 5000
-    ) -> List[List[Tuple[str, float, int]]]:
-        logger.info(f"Retrieving top {top_k} candidates for {len(query_texts):,} queries using CPU Char-TFIDF...")
-        start_t = time.time()
-        
-        query_matrix = self.vectorizer.transform(query_texts)
-        num_queries = query_matrix.shape[0]
-        results: List[List[Tuple[str, float, int]]] = []
-        corpus_T = self.corpus_matrix.T.tocsr()
-        
-        for start_idx in range(0, num_queries, batch_size):
-            end_idx = min(start_idx + batch_size, num_queries)
-            q_batch = query_matrix[start_idx:end_idx]
-            scores_batch = q_batch.dot(corpus_T)
-            
-            for row_idx in range(scores_batch.shape[0]):
-                row = scores_batch.getrow(row_idx)
-                if row.nnz == 0:
-                    results.append([])
-                    continue
-                indices = row.indices
-                data = row.data
-                
-                if len(data) <= top_k:
-                    sorted_order = np.argsort(data)[::-1]
-                    top_idx = indices[sorted_order]
-                    top_sc = data[sorted_order]
-                else:
-                    part_idx = np.argpartition(data, -top_k)[-top_k:]
-                    sorted_order = part_idx[np.argsort(data[part_idx])[::-1]]
-                    top_idx = indices[sorted_order]
-                    top_sc = data[sorted_order]
-                    
-                row_results = []
-                for rank, (idx, sc) in enumerate(zip(top_idx, top_sc), start=1):
-                    s_val = float(sc)
-                    if s_val <= 0.0:
-                        break
-                    row_results.append((self.s1_ids[idx], s_val, rank))
-                results.append(row_results)
-                
-        elapsed = time.time() - start_t
-        logger.info(f"CPU Char-TFIDF retrieval finished in {elapsed:.2f}s.")
-        return results
-
-
-class BM25Retriever:
-    """
-    BM25 retriever using rank_bm25 with fast token indexing and candidate filtering.
-    """
-    def __init__(self):
-        self.bm25: BM25Okapi = None
+        k1: float = 1.5,
+        b: float = 0.75,
+        max_features: int = 100000,
+        min_df: int = 1
+    ):
+        self.k1 = k1
+        self.b = b
+        self.max_features = max_features
+        self.min_df = min_df
+        self.vectorizer = CountVectorizer(
+            token_pattern=r"(?u)\b\w+\b",
+            max_features=max_features,
+            min_df=min_df,
+            dtype=np.float32
+        )
+        self.bm25_matrix_T: csr_matrix = None
         self.s1_ids: List[str] = []
 
     def fit(self, corpus_texts: List[str], s1_ids: List[str]):
-        logger.info(f"Fitting BM25 index on {len(corpus_texts):,} texts...")
+        """Fits count vectorizer, computes BM25 weights, and transposes matrix."""
         start_t = time.time()
-        tokenized_corpus = [doc.split() for doc in corpus_texts]
-        self.bm25 = BM25Okapi(tokenized_corpus)
-        self.s1_ids = list(s1_ids)
-        elapsed = time.time() - start_t
-        logger.info(f"BM25 fitted in {elapsed:.2f}s.")
-
-    def retrieve_top_k(self, query_texts: List[str], top_k: int = 30) -> List[List[Tuple[str, float, int]]]:
-        """
-        Retrieves top_k candidates for each query text.
-        """
-        logger.info(f"Retrieving top {top_k} candidates for {len(query_texts):,} queries using BM25...")
-        start_t = time.time()
-        results: List[List[Tuple[str, float, int]]] = []
+        logger.info(f"[RETRIEVAL] Fitting Sparse BM25 (k1={self.k1}, b={self.b}) on {len(corpus_texts):,} reference texts...")
         
-        for q in query_texts:
-            tokens = q.split()
-            if not tokens:
-                results.append([])
-                continue
-            scores = self.bm25.get_scores(tokens)
-            if top_k >= len(scores):
-                top_indices = np.argsort(scores)[::-1]
-            else:
-                partition_idx = np.argpartition(scores, -top_k)[-top_k:]
-                top_indices = partition_idx[np.argsort(scores[partition_idx])[::-1]]
-                
-            row_results = []
-            for rank, idx in enumerate(top_indices, start=1):
-                score = float(scores[idx])
-                if score <= 0.0:
-                    break
-                row_results.append((self.s1_ids[idx], score, rank))
-            results.append(row_results)
-            
+        # Word count matrix: (N, V)
+        X = self.vectorizer.fit_transform(corpus_texts)
+        N, V = X.shape
+        
+        # Document frequencies per term
+        df = np.bincount(X.indices, minlength=V)
+        # BM25 probabilistic IDF: log((N - df + 0.5) / (df + 0.5) + 1.0)
+        idf = np.log((N - df + 0.5) / (df + 0.5) + 1.0).astype(np.float32)
+        
+        # Document lengths
+        doc_lengths = np.array(X.sum(axis=1)).flatten().astype(np.float32)
+        avg_doc_len = float(np.mean(doc_lengths)) if len(doc_lengths) > 0 else 1.0
+        
+        # Compute BM25 transformed term weights for non-zero elements
+        rows, cols = X.nonzero()
+        data = X.data.astype(np.float32)
+        
+        len_norm = (1.0 - self.b + self.b * (doc_lengths[rows] / avg_doc_len)).astype(np.float32)
+        tf_component = (data * (self.k1 + 1.0)) / (data + self.k1 * len_norm)
+        bm25_data = tf_component * idf[cols]
+        
+        bm25_matrix = csr_matrix((bm25_data, (rows, cols)), shape=(N, V), dtype=np.float32)
+        self.bm25_matrix_T = bm25_matrix.T.tocsr()
+        self.s1_ids = list(s1_ids)
+        
         elapsed = time.time() - start_t
-        logger.info(f"BM25 retrieval finished in {elapsed:.2f}s.")
+        logger.info(
+            f"[RETRIEVAL] Sparse BM25 fitted in {elapsed:.2f}s. Vocab size: {len(self.vectorizer.vocabulary_):,}, "
+            f"Matrix: {N:,}x{V:,} ({bm25_matrix.nnz:,} non-zeros)"
+        )
+
+    def retrieve_top_k(
+        self,
+        query_texts: List[str],
+        top_k: int = 20,
+        batch_size: int = 5000
+    ) -> List[List[Tuple[str, float, int]]]:
+        """
+        Retrieves top_k reference entities for each query text using BM25 scoring.
+        Returns list of [(s1_id, bm25_score, rank), ...] per query.
+        """
+        if self.bm25_matrix_T is None:
+            raise ValueError("Retriever has not been fitted.")
+            
+        num_queries = len(query_texts)
+        results: List[List[Tuple[str, float, int]]] = []
+        start_t = time.time()
+        
+        for start_idx in range(0, num_queries, batch_size):
+            end_idx = min(start_idx + batch_size, num_queries)
+            q_batch = query_texts[start_idx:end_idx]
+            
+            # Binary term occurrence in query
+            q_matrix = self.vectorizer.transform(q_batch)
+            q_matrix.data = np.ones_like(q_matrix.data, dtype=np.float32)
+            
+            # Sparse dot product
+            scores_batch = q_matrix.dot(self.bm25_matrix_T)
+            
+            for row_idx in range(scores_batch.shape[0]):
+                row = scores_batch.getrow(row_idx)
+                if row.nnz == 0:
+                    results.append([])
+                    continue
+                
+                data = row.data
+                indices = row.indices
+                
+                if len(data) <= top_k:
+                    order = np.argsort(-data)
+                else:
+                    part = np.argpartition(data, -top_k)[-top_k:]
+                    order = part[np.argsort(-data[part])]
+                    
+                row_cands = []
+                for rank, j in enumerate(order, start=1):
+                    sc = float(data[j])
+                    if sc <= 0.001:
+                        break
+                    row_cands.append((self.s1_ids[indices[j]], sc, rank))
+                results.append(row_cands)
+                
+        elapsed = time.time() - start_t
+        logger.info(f"[RETRIEVAL] Sparse BM25 retrieved top-{top_k} for {num_queries:,} queries in {elapsed:.2f}s ({num_queries/max(elapsed, 0.001):.0f} q/s)")
         return results
+
+
+class ExactMatchIndex:
+    """
+    Inverted hash-map index for exact string matching on reference entities.
+    Supports lookup with frequency capping to avoid massive Cartesian products on generic terms.
+    """
+    def __init__(self, max_bucket_size: int = 100):
+        self.max_bucket_size = max_bucket_size
+        self.index: Dict[str, Set[str]] = {}
+
+    def fit(self, texts: List[str], s1_ids: List[str]):
+        """Indexes non-empty strings to set of S1 IDs."""
+        self.index.clear()
+        for text, s1_id in zip(texts, s1_ids):
+            if text and len(text) >= 2:
+                self.index.setdefault(text, set()).add(s1_id)
+        logger.info(f"[RETRIEVAL] ExactMatchIndex built with {len(self.index):,} unique keys.")
+
+    def lookup(self, text: str) -> Set[str]:
+        """Returns matching S1 IDs if key exists and bucket is within safe size limit."""
+        if not text:
+            return set()
+        bucket = self.index.get(text)
+        if not bucket or len(bucket) > self.max_bucket_size:
+            return set()
+        return bucket

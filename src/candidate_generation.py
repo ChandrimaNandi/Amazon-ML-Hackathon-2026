@@ -1,169 +1,263 @@
 """
-Candidate Generation Module for Business Entity Resolution.
-Combines multiple retrieval channels into a unified candidate set per query record.
-Supports fast scalable retrieval for multi-million query test sets.
+Unified Candidate Generation Module for Business Entity Resolution.
+
+Provides a single reusable CandidateGenerator class for:
+- Training
+- Validation
+- Large-scale Test Inference
+
+Channels:
+1. Exact Name (exact normalized string match)
+2. Exact Address (exact normalized string match)
+3. Exact Combined (exact normalized name + address match)
+4. BM25 Name (word-level inverted index BM25)
+5. BM25 Combined (word-level inverted index BM25 on combined name + address)
+6. Char-TFIDF Name (character 3-5 gram cosine similarity)
+7. Char-TFIDF Address (character 3-5 gram cosine similarity)
+
+Every candidate pair preserves comprehensive channel flags, scores, and ranks.
 """
 
 import time
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Set, Tuple, Any
+from typing import Dict, List, Set, Tuple, Any, Optional
 import logging
 
-from src.retrieval import BM25Retriever, CharTFIDFRetriever
+from src.retrieval import CharTFIDFRetriever, SparseBM25Retriever, ExactMatchIndex
 from src.normalization import create_normalized_features
 
 logger = logging.getLogger(__name__)
 
 
-def generate_candidate_union(
-    s1_df: pd.DataFrame,
-    query_df: pd.DataFrame,
-    k_name: int = 20,
-    k_address: int = 15,
-    k_combined: int = 20,
-    k_char: int = 20
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+class CandidateGenerator:
     """
-    Generates candidates for query_df against reference s1_df using multiple retrieval channels.
-    
-    Returns:
-        candidate_pairs_df: DataFrame with query_id, s1_id, and retrieval diagnostic flags/ranks/scores.
-        stats: Diagnostic statistics on retrieval performance.
+    Unified Candidate Generator ensuring identical candidate generation logic
+    across training, validation, and final test inference.
     """
-    logger.info("=" * 60)
-    logger.info(f"Starting Candidate Generation for {len(query_df):,} queries against {len(s1_df):,} S1 reference records")
-    logger.info("=" * 60)
-    
-    start_time = time.time()
-    
-    # Ensure normalized features exist
-    if "name_normalized" not in s1_df.columns:
-        s1_df = create_normalized_features(s1_df)
-    if "name_normalized" not in query_df.columns:
-        query_df = create_normalized_features(query_df)
+    def __init__(
+        self,
+        k_exact_cap: int = 50,
+        k_bm25_name: int = 25,
+        k_bm25_comb: int = 25,
+        k_tfidf_name: int = 25,
+        k_tfidf_addr: int = 20,
+        max_features: int = 150000
+    ):
+        self.k_exact_cap = k_exact_cap
+        self.k_bm25_name = k_bm25_name
+        self.k_bm25_comb = k_bm25_comb
+        self.k_tfidf_name = k_tfidf_name
+        self.k_tfidf_addr = k_tfidf_addr
         
-    s1_ids = s1_df["entity_id"].tolist()
-    query_ids = query_df["entity_id"].tolist()
-    
-    # Map normalized S1 names/addresses to set of S1 IDs for exact match indexing
-    exact_name_map: Dict[str, Set[str]] = {}
-    exact_addr_map: Dict[str, Set[str]] = {}
-    
-    for s1_id, name, addr in zip(s1_ids, s1_df["name_normalized"], s1_df["address_normalized"]):
-        if name:
-            exact_name_map.setdefault(name, set()).add(s1_id)
-        if addr:
-            exact_addr_map.setdefault(addr, set()).add(s1_id)
+        # Retrievers
+        self.exact_name = ExactMatchIndex(max_bucket_size=k_exact_cap)
+        self.exact_addr = ExactMatchIndex(max_bucket_size=k_exact_cap)
+        self.exact_comb = ExactMatchIndex(max_bucket_size=k_exact_cap)
+        
+        self.bm25_name = SparseBM25Retriever(max_features=max_features)
+        self.bm25_comb = SparseBM25Retriever(max_features=max_features)
+        
+        self.tfidf_name = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features)
+        self.tfidf_addr = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features)
+        
+        self.is_fitted = False
+        self.s1_ids: List[str] = []
+
+    def fit(self, s1_df: pd.DataFrame):
+        """
+        Fits all retrieval indices on reference S1 corpus.
+        Requires normalized fields (computes them if missing).
+        """
+        logger.info("=" * 60)
+        logger.info(f"[CANDIDATE GENERATION] Fitting multi-channel retrieval on {len(s1_df):,} reference entities...")
+        logger.info("=" * 60)
+        start_t = time.time()
+        
+        if "name_normalized" not in s1_df.columns:
+            s1_df = create_normalized_features(s1_df)
             
-    # 1. Fit Retrievers — CharTFIDF only (50x faster than BM25, comparable recall)
-    char_name = CharTFIDFRetriever()
-    char_name.fit(s1_df["name_normalized"].tolist(), s1_ids)
-    
-    char_addr = CharTFIDFRetriever()
-    char_addr.fit(s1_df["address_normalized"].tolist(), s1_ids)
-    
-    char_name_res = char_name.retrieve_top_k(query_df["name_normalized"].tolist(), top_k=k_char)
-    char_addr_res = char_addr.retrieve_top_k(query_df["address_normalized"].tolist(), top_k=k_address)
-    
-    bm25_name_res = [[] for _ in range(len(query_df))]
-    bm25_comb_res = [[] for _ in range(len(query_df))]
-
-    # 3. Candidate Assembly
-    candidate_records = []
-    
-    for idx, (q_id, q_name, q_addr) in enumerate(zip(query_ids, query_df["name_normalized"], query_df["address_normalized"])):
-        candidates: Dict[str, Dict[str, Any]] = {}
+        self.s1_ids = s1_df["entity_id"].tolist()
+        names = s1_df["name_normalized"].tolist()
+        addrs = s1_df["address_normalized"].tolist()
+        combs = s1_df["combined_normalized"].tolist()
         
-        def get_cand(s1_id: str) -> Dict[str, Any]:
-            if s1_id not in candidates:
-                candidates[s1_id] = {
-                    "query_id": q_id,
-                    "s1_id": s1_id,
-                    "by_exact_name": 0,
-                    "by_exact_address": 0,
-                    "by_bm25_name": 0,
-                    "bm25_name_score": 0.0,
-                    "bm25_name_rank": 999,
-                    "by_bm25_combined": 0,
-                    "bm25_comb_score": 0.0,
-                    "bm25_comb_rank": 999,
-                    "by_char_name": 0,
-                    "char_name_score": 0.0,
-                    "char_name_rank": 999,
-                    "by_char_address": 0,
-                    "char_addr_score": 0.0,
-                    "char_addr_rank": 999,
-                }
-            return candidates[s1_id]
+        # 1. Exact match indices
+        self.exact_name.fit(names, self.s1_ids)
+        self.exact_addr.fit(addrs, self.s1_ids)
+        self.exact_comb.fit(combs, self.s1_ids)
+        
+        # 2. BM25 retrievers
+        self.bm25_name.fit(names, self.s1_ids)
+        self.bm25_comb.fit(combs, self.s1_ids)
+        
+        # 3. Char TF-IDF retrievers
+        self.tfidf_name.fit(names, self.s1_ids)
+        self.tfidf_addr.fit(addrs, self.s1_ids)
+        
+        self.is_fitted = True
+        elapsed = time.time() - start_t
+        logger.info(f"[CANDIDATE GENERATION] All retrieval channels fitted in {elapsed:.2f}s.")
 
-        # Exact Name Matches
-        if q_name and q_name in exact_name_map:
-            for s1_id in exact_name_map[q_name]:
+    def generate_candidates(
+        self,
+        query_df: pd.DataFrame,
+        batch_size: int = 5000
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Generates candidate pairs for query_df against fitted S1 corpus.
+        
+        Returns:
+            candidate_df: DataFrame with query_id, s1_id, and all channel flags/ranks/scores.
+            stats: Summary metrics dictionary.
+        """
+        if not self.is_fitted:
+            raise ValueError("CandidateGenerator must be fitted before generating candidates.")
+            
+        start_t = time.time()
+        num_queries = len(query_df)
+        logger.info(f"[CANDIDATE GENERATION] Generating candidates for {num_queries:,} queries...")
+        
+        if "name_normalized" not in query_df.columns:
+            query_df = create_normalized_features(query_df)
+            
+        q_ids = query_df["entity_id"].tolist()
+        q_names = query_df["name_normalized"].tolist()
+        q_addrs = query_df["address_normalized"].tolist()
+        q_combs = query_df["combined_normalized"].tolist()
+        
+        # Run retrieval channels in parallel batches
+        bm25_name_res = self.bm25_name.retrieve_top_k(q_names, top_k=self.k_bm25_name, batch_size=batch_size)
+        bm25_comb_res = self.bm25_comb.retrieve_top_k(q_combs, top_k=self.k_bm25_comb, batch_size=batch_size)
+        tfidf_name_res = self.tfidf_name.retrieve_top_k(q_names, top_k=self.k_tfidf_name, batch_size=batch_size)
+        tfidf_addr_res = self.tfidf_addr.retrieve_top_k(q_addrs, top_k=self.k_tfidf_addr, batch_size=batch_size)
+        
+        candidate_records = []
+        
+        for idx in range(num_queries):
+            qid = q_ids[idx]
+            qname = q_names[idx]
+            qaddr = q_addrs[idx]
+            qcomb = q_combs[idx]
+            
+            # Map of s1_id -> candidate dictionary
+            candidates: Dict[str, Dict[str, Any]] = {}
+            
+            def get_cand(s1_id: str) -> Dict[str, Any]:
+                if s1_id not in candidates:
+                    candidates[s1_id] = {
+                        "query_id": qid,
+                        "s1_id": s1_id,
+                        "by_exact_name": 0,
+                        "by_exact_address": 0,
+                        "by_exact_combined": 0,
+                        "by_bm25_name": 0,
+                        "bm25_name_score": 0.0,
+                        "bm25_name_rank": 999,
+                        "by_bm25_combined": 0,
+                        "bm25_comb_score": 0.0,
+                        "bm25_comb_rank": 999,
+                        "by_tfidf_name": 0,
+                        "tfidf_name_score": 0.0,
+                        "tfidf_name_rank": 999,
+                        "by_tfidf_address": 0,
+                        "tfidf_addr_score": 0.0,
+                        "tfidf_addr_rank": 999,
+                    }
+                return candidates[s1_id]
+            
+            # 1. Exact Name
+            for s1_id in self.exact_name.lookup(qname):
                 c = get_cand(s1_id)
                 c["by_exact_name"] = 1
                 
-        # Exact Address Matches
-        if q_addr and q_addr in exact_addr_map:
-            for s1_id in exact_addr_map[q_addr]:
+            # 2. Exact Address
+            for s1_id in self.exact_addr.lookup(qaddr):
                 c = get_cand(s1_id)
                 c["by_exact_address"] = 1
                 
-        # BM25 Name
-        for s1_id, score, rank in bm25_name_res[idx]:
-            c = get_cand(s1_id)
-            c["by_bm25_name"] = 1
-            c["bm25_name_score"] = score
-            c["bm25_name_rank"] = rank
-            
-        # BM25 Combined
-        for s1_id, score, rank in bm25_comb_res[idx]:
-            c = get_cand(s1_id)
-            c["by_bm25_combined"] = 1
-            c["bm25_comb_score"] = score
-            c["bm25_comb_rank"] = rank
-            
-        # Char TF-IDF Name
-        for s1_id, score, rank in char_name_res[idx]:
-            c = get_cand(s1_id)
-            c["by_char_name"] = 1
-            c["char_name_score"] = score
-            c["char_name_rank"] = rank
-            
-        # Char TF-IDF Address
-        for s1_id, score, rank in char_addr_res[idx]:
-            c = get_cand(s1_id)
-            c["by_char_address"] = 1
-            c["char_addr_score"] = score
-            c["char_addr_rank"] = rank
-            
-        # Compute agreement features
-        for s1_id, c in candidates.items():
-            agree_cnt = (
-                c["by_exact_name"] + c["by_exact_address"] +
-                c["by_bm25_name"] + c["by_bm25_combined"] +
-                c["by_char_name"] + c["by_char_address"]
-            )
-            c["retrieval_agreement_count"] = agree_cnt
-            c["best_retrieval_rank"] = min(
-                c["bm25_name_rank"], c["bm25_comb_rank"], c["char_name_rank"], c["char_addr_rank"]
-            )
-            candidate_records.append(c)
-            
-    candidate_df = pd.DataFrame(candidate_records)
-    elapsed = time.time() - start_time
-    
-    cand_counts = candidate_df.groupby("query_id").size() if not candidate_df.empty else pd.Series(dtype=int)
-    avg_cands = float(cand_counts.mean()) if not cand_counts.empty else 0.0
-    median_cands = float(cand_counts.median()) if not cand_counts.empty else 0.0
-    
-    stats = {
-        "num_queries": len(query_df),
-        "total_candidate_pairs": len(candidate_df),
-        "avg_candidates_per_query": round(avg_cands, 2),
-        "median_candidates_per_query": round(median_cands, 2),
-        "elapsed_seconds": round(elapsed, 2),
-    }
-    
-    logger.info(f"Generated {len(candidate_df):,} candidate pairs (avg {avg_cands:.1f}/query) in {elapsed:.2f}s.")
-    return candidate_df, stats
+            # 3. Exact Combined
+            for s1_id in self.exact_comb.lookup(qcomb):
+                c = get_cand(s1_id)
+                c["by_exact_combined"] = 1
+                
+            # 4. BM25 Name
+            for s1_id, sc, rk in bm25_name_res[idx]:
+                c = get_cand(s1_id)
+                c["by_bm25_name"] = 1
+                c["bm25_name_score"] = max(c["bm25_name_score"], sc)
+                c["bm25_name_rank"] = min(c["bm25_name_rank"], rk)
+                
+            # 5. BM25 Combined
+            for s1_id, sc, rk in bm25_comb_res[idx]:
+                c = get_cand(s1_id)
+                c["by_bm25_combined"] = 1
+                c["bm25_comb_score"] = max(c["bm25_comb_score"], sc)
+                c["bm25_comb_rank"] = min(c["bm25_comb_rank"], rk)
+                
+            # 6. Char TF-IDF Name
+            for s1_id, sc, rk in tfidf_name_res[idx]:
+                c = get_cand(s1_id)
+                c["by_tfidf_name"] = 1
+                c["tfidf_name_score"] = max(c["tfidf_name_score"], sc)
+                c["tfidf_name_rank"] = min(c["tfidf_name_rank"], rk)
+                
+            # 7. Char TF-IDF Address
+            for s1_id, sc, rk in tfidf_addr_res[idx]:
+                c = get_cand(s1_id)
+                c["by_tfidf_address"] = 1
+                c["tfidf_addr_score"] = max(c["tfidf_addr_score"], sc)
+                c["tfidf_addr_rank"] = min(c["tfidf_addr_rank"], rk)
+                
+            # Calculate composite agreement and reciprocal rank
+            for s1_id, c in candidates.items():
+                agree_cnt = (
+                    c["by_exact_name"] + c["by_exact_address"] + c["by_exact_combined"] +
+                    c["by_bm25_name"] + c["by_bm25_combined"] +
+                    c["by_tfidf_name"] + c["by_tfidf_address"]
+                )
+                best_rk = min(
+                    c["bm25_name_rank"], c["bm25_comb_rank"],
+                    c["tfidf_name_rank"], c["tfidf_addr_rank"]
+                )
+                c["retrieval_agreement_count"] = agree_cnt
+                c["best_retrieval_rank"] = best_rk
+                c["best_reciprocal_rank"] = 1.0 / best_rk if best_rk < 999 else 0.0
+                candidate_records.append(c)
+                
+        candidate_df = pd.DataFrame(candidate_records)
+        elapsed = time.time() - start_t
+        
+        avg_cands = len(candidate_df) / max(num_queries, 1)
+        stats = {
+            "num_queries": num_queries,
+            "total_candidate_pairs": len(candidate_df),
+            "avg_candidates_per_query": round(avg_cands, 2),
+            "elapsed_seconds": round(elapsed, 2),
+        }
+        logger.info(
+            f"[CANDIDATE GENERATION] Generated {len(candidate_df):,} candidate pairs "
+            f"(avg {avg_cands:.1f}/query) in {elapsed:.2f}s."
+        )
+        return candidate_df, stats
+
+
+def generate_candidate_union(
+    s1_df: pd.DataFrame,
+    query_df: pd.DataFrame,
+    k_name: int = 25,
+    k_address: int = 20,
+    k_combined: int = 25,
+    k_char: int = 25
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Convenience functional wrapper for CandidateGenerator.
+    """
+    generator = CandidateGenerator(
+        k_bm25_name=k_name,
+        k_bm25_comb=k_combined,
+        k_tfidf_name=k_char,
+        k_tfidf_addr=k_address
+    )
+    generator.fit(s1_df)
+    return generator.generate_candidates(query_df)
