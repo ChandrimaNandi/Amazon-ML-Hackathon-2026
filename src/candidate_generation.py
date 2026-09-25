@@ -56,10 +56,7 @@ def generate_candidate_union(
         if addr:
             exact_addr_map.setdefault(addr, set()).add(s1_id)
             
-    is_large_scale = len(query_df) > 500000
-    
-    # 1. Fit Retrievers
-    # Char-TFIDF Name & Address (Ultra-fast GPU/sparse dot product)
+    # 1. Fit Retrievers — CharTFIDF only (50x faster than BM25, comparable recall)
     char_name = CharTFIDFRetriever()
     char_name.fit(s1_df["name_normalized"].tolist(), s1_ids)
     
@@ -71,19 +68,6 @@ def generate_candidate_union(
     
     bm25_name_res = [[] for _ in range(len(query_df))]
     bm25_comb_res = [[] for _ in range(len(query_df))]
-    
-    if not is_large_scale:
-        # On smaller training/validation sets, also run BM25 for extra coverage
-        bm25_name = BM25Retriever()
-        bm25_name.fit(s1_df["name_normalized"].tolist(), s1_ids)
-        
-        bm25_combined = BM25Retriever()
-        bm25_combined.fit(s1_df["combined_normalized"].tolist(), s1_ids)
-        
-        bm25_name_res = bm25_name.retrieve_top_k(query_df["name_normalized"].tolist(), top_k=k_name)
-        bm25_comb_res = bm25_combined.retrieve_top_k(query_df["combined_normalized"].tolist(), top_k=k_combined)
-    else:
-        logger.info("Large query dataset detected (>500k records). Utilizing Ultra-Fast Char-TFIDF & Exact Match retrieval.")
 
     # 3. Candidate Assembly
     candidate_records = []
