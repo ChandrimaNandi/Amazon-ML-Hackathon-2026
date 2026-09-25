@@ -215,7 +215,7 @@ import scipy
 import sklearn
 import lightgbm as lgb
 
-from src.data_loader import load_source_tsv, load_ground_truth
+from src.data_loader import load_source_tsv, load_ground_truth, load_coherent_training_sample
 from src.normalization import normalize_text, transliterate_to_latin, create_normalized_features
 from src.retrieval import CharTFIDFRetriever, SparseBM25Retriever, ExactMatchIndex
 from src.candidate_generation import CandidateGenerator, generate_candidate_union
@@ -268,43 +268,33 @@ for label, p in files_to_check:
 
     # 4. Data Loading
     add_md("""## 4. Data Loading
-Load representative training reference entities and query records dynamically along with ground truth match mappings.""")
-    add_code("""print("[DATA] Loading training reference and query samples...")
+Load representative training reference entities and coherent query records using ground-truth-guided slicing to prevent orphan query leakage.""")
+    add_code("""print("[DATA] Loading coherent training reference and query samples...")
 stage_timer.start("data_loading")
 start_t = time.time()
 
-# Load representative S1 records dynamically (configurable via config/environment)
-s1_raw_df = pd.read_csv(TRAIN_S1_PATH, sep="\\t", nrows=SAMPLE_S1_ROWS, keep_default_na=False, dtype=str)
-for col in ["entity_id", "business_name", "business_address", "country"]:
-    s1_raw_df[col] = s1_raw_df[col].astype(str).str.strip()
+# Coherent ground-truth-guided data loading:
+# Queries are dynamically loaded to ensure 100% of positive pairs have their target S1 in the sample
+s1_raw_df, query_raw_df, sample_gt = load_coherent_training_sample(
+    s1_path=TRAIN_S1_PATH,
+    gt_path=TRAIN_GROUND_TRUTH_PATH,
+    s2_path=TRAIN_S2_PATH,
+    s3_path=TRAIN_S3_PATH,
+    sample_s1_rows=SAMPLE_S1_ROWS or 25000,
+    max_active_queries=SAMPLE_ACTIVE_QUERIES or 25000,
+    num_unmatched_queries=2000,
+    random_seed=RANDOM_SEED
+)
 
-# Load ground truth
-gt_df, s1_to_matches, match_to_s1 = load_ground_truth(TRAIN_GROUND_TRUTH_PATH)
-
-sample_s1_ids = set(s1_raw_df["entity_id"])
-sample_gt = {s1: s1_to_matches.get(s1, set()) for s1 in sample_s1_ids}
-sample_q_ids = set()
-for q_set in sample_gt.values():
-    sample_q_ids.update(q_set)
-
-# Load queries corresponding to sample S1 entities plus negatives
-s2_raw = pd.read_csv(TRAIN_S2_PATH, sep="\\t", nrows=SAMPLE_QUERY_ROWS, keep_default_na=False, dtype=str)
-s3_raw = pd.read_csv(TRAIN_S3_PATH, sep="\\t", nrows=SAMPLE_QUERY_ROWS, keep_default_na=False, dtype=str)
-query_raw_df = pd.concat([s2_raw, s3_raw], ignore_index=True)
-for col in ["entity_id", "business_name", "business_address", "country"]:
-    query_raw_df[col] = query_raw_df[col].astype(str).str.strip()
-
-active_limit = SAMPLE_ACTIVE_QUERIES or 10000
-query_raw_df = query_raw_df[
-    query_raw_df["entity_id"].isin(sample_q_ids) | (query_raw_df.index < active_limit)
-].head(active_limit).reset_index(drop=True)
+# Load ground truth sample for EDA profiling
+gt_df = pd.read_csv(TRAIN_GROUND_TRUTH_PATH, sep="\\t", nrows=50000, keep_default_na=False, dtype=str)
 
 elapsed = stage_timer.stop("data_loading")
 release_memory()
-print(f"[DATA] Data loaded in {elapsed:.2f}s:")
+print(f"[DATA] Coherent dataset loaded in {elapsed:.2f}s:")
 print(f"  Reference S1 Entities: {len(s1_raw_df):,}")
 print(f"  Active Query Records:  {len(query_raw_df):,}")
-print(f"  Total True Matches:    {sum(len(q) for q in sample_gt.values()):,}")
+print(f"  Active True Links:     {sum(len(q) for q in sample_gt.values()):,}")
 """)
 
     # 5. EDA
@@ -610,7 +600,7 @@ Train final model on complete training candidate pool with tuned hyper-parameter
     add_code("""print("[RETRAINING] Training final entity matcher for submission...")
 
 final_model = EntityMatcherModel()
-final_model.fit(balanced_train_df)
+final_model.fit(balanced_train_df, val_df=val_feat_df)
 
 final_model_path = RESULTS_DIR / "final_submission_model.pkl"
 final_model.save_model(final_model_path)

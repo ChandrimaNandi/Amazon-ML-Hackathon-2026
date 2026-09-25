@@ -145,6 +145,7 @@ def run_ablation_experiments(
     retrieval_agree_cols = ["retrieval_agreement_count", "best_retrieval_rank", "best_reciprocal_rank"]
     bm25_cols = ["by_bm25_name", "bm25_name_score", "bm25_name_rank", "by_bm25_combined", "bm25_comb_score", "bm25_comb_rank"]
     tfidf_cols = ["by_tfidf_name", "tfidf_name_score", "tfidf_name_rank", "by_tfidf_address", "tfidf_addr_score", "tfidf_addr_rank"]
+    disambig_cols = ["is_acronym_match", "distinct_name_mismatch", "us_state_mismatch", "missing_addr_penalty"]
     
     experiment_configs = [
         ("1. Exact matching only", exact_cols),
@@ -175,9 +176,9 @@ def run_ablation_experiments(
         start_t = time.time()
         active_cols = [c for c in feat_subset if c in train_feat_df.columns]
         
-        # Fit model on feature subset
+        # Fit model on feature subset with validation early stopping
         model = EntityMatcherModel()
-        model.fit(train_df=train_feat_df, feature_cols=active_cols)
+        model.fit(train_df=train_feat_df, val_df=val_feat_df, feature_cols=active_cols)
         
         # Predict on validation candidate pairs
         val_sub = val_feat_df.copy()

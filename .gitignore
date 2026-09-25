@@ -14,7 +14,9 @@ dataset/
 *.tsv
 *.zip
 
-results/*
+results/
+
+runs/
 
 # Generated Output
 output/

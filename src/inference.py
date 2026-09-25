@@ -102,11 +102,11 @@ def run_chunked_inference(
     
     # 2. Fit unified CandidateGenerator once on reference S1
     generator = CandidateGenerator(
-        k_exact_cap=50,
-        k_bm25_name=25,
-        k_bm25_comb=25,
-        k_tfidf_name=25,
-        k_tfidf_addr=20
+        k_exact_cap=30,
+        k_bm25_name=15,
+        k_bm25_comb=15,
+        k_tfidf_name=15,
+        k_tfidf_addr=10
     )
     generator.fit(s1_df)
     
@@ -179,20 +179,30 @@ def run_chunked_inference(
                         enforce_query_exclusivity=True
                     )
                     
-                    # E. Stream candidates directly to disk shards
-                    for row in cand_df.itertuples():
-                        sh = s1_to_shard.get(row.s1_id)
+                    # E. Stream candidates directly to disk shards with bulk buffering
+                    shard_cand_buffers: Dict[int, List[str]] = {s: [] for s in range(num_shards)}
+                    for s1_id, q_id in zip(cand_df["s1_id"], cand_df["query_id"]):
+                        sh = s1_to_shard.get(s1_id)
                         if sh is not None:
-                            cand_fps[sh].write(f"{row.s1_id}\t{row.query_id}\n")
+                            shard_cand_buffers[sh].append(f"{s1_id}\t{q_id}\n")
                             
-                    # F. Stream predictions directly to disk shards
+                    for sh, lines in shard_cand_buffers.items():
+                        if lines:
+                            cand_fps[sh].write("".join(lines))
+                            
+                    # F. Stream predictions directly to disk shards with bulk buffering
+                    shard_pred_buffers: Dict[int, List[str]] = {s: [] for s in range(num_shards)}
                     for s1_id, q_ids in chunk_preds.items():
                         sh = s1_to_shard.get(s1_id)
                         if sh is not None:
                             for q_id in q_ids:
-                                pred_fps[sh].write(f"{s1_id}\t{q_id}\n")
+                                shard_pred_buffers[sh].append(f"{s1_id}\t{q_id}\n")
                                 
-                    del feat_df, chunk_preds
+                    for sh, lines in shard_pred_buffers.items():
+                        if lines:
+                            pred_fps[sh].write("".join(lines))
+                                
+                    del feat_df, chunk_preds, shard_cand_buffers, shard_pred_buffers
                     
                 total_queries_processed += n_queries_in_chunk
                 rss_mb = process.memory_info().rss / (1024 ** 2)

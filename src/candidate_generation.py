@@ -37,12 +37,12 @@ class CandidateGenerator:
     """
     def __init__(
         self,
-        k_exact_cap: int = 50,
-        k_bm25_name: int = 25,
-        k_bm25_comb: int = 25,
-        k_tfidf_name: int = 25,
-        k_tfidf_addr: int = 20,
-        max_features: int = 150000
+        k_exact_cap: int = 30,
+        k_bm25_name: int = 15,
+        k_bm25_comb: int = 15,
+        k_tfidf_name: int = 15,
+        k_tfidf_addr: int = 10,
+        max_features: int = 100000
     ):
         self.k_exact_cap = k_exact_cap
         self.k_bm25_name = k_bm25_name
@@ -63,6 +63,7 @@ class CandidateGenerator:
         
         self.is_fitted = False
         self.s1_ids: List[str] = []
+        self.s1_countries: Dict[str, str] = {}
 
     def fit(self, s1_df: pd.DataFrame):
         """
@@ -78,6 +79,10 @@ class CandidateGenerator:
             s1_df = create_normalized_features(s1_df)
             
         self.s1_ids = s1_df["entity_id"].tolist()
+        self.s1_countries = {
+            row.entity_id: str(getattr(row, "country", "")).strip().casefold()
+            for row in s1_df.itertuples()
+        }
         names = s1_df["name_normalized"].tolist()
         addrs = s1_df["address_normalized"].tolist()
         combs = s1_df["combined_normalized"].tolist()
@@ -105,7 +110,7 @@ class CandidateGenerator:
         batch_size: int = 5000
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
-        Generates candidate pairs for query_df against fitted S1 corpus.
+        Generates candidate pairs for query_df against fitted S1 corpus with country hard-blocking.
         
         Returns:
             candidate_df: DataFrame with query_id, s1_id, and all channel flags/ranks/scores.
@@ -125,6 +130,10 @@ class CandidateGenerator:
         q_names = query_df["name_normalized"].tolist()
         q_addrs = query_df["address_normalized"].tolist()
         q_combs = query_df["combined_normalized"].tolist()
+        q_countries = [
+            str(getattr(r, "country", "")).strip().casefold()
+            for r in query_df.itertuples()
+        ]
         
         # Run retrieval channels in parallel batches
         bm25_name_res = self.bm25_name.retrieve_top_k(q_names, top_k=self.k_bm25_name, batch_size=batch_size)
@@ -139,11 +148,18 @@ class CandidateGenerator:
             qname = q_names[idx]
             qaddr = q_addrs[idx]
             qcomb = q_combs[idx]
+            q_cntry = q_countries[idx] if idx < len(q_countries) else ""
             
             # Map of s1_id -> candidate dictionary
             candidates: Dict[str, Dict[str, Any]] = {}
             
-            def get_cand(s1_id: str) -> Dict[str, Any]:
+            def get_cand(s1_id: str) -> Optional[Dict[str, Any]]:
+                # Strict country hard-blocking (US never matches India)
+                if q_cntry:
+                    s1_cntry = self.s1_countries.get(s1_id, "")
+                    if s1_cntry and s1_cntry != q_cntry:
+                        return None
+                        
                 if s1_id not in candidates:
                     candidates[s1_id] = {
                         "query_id": qid,
@@ -169,45 +185,52 @@ class CandidateGenerator:
             # 1. Exact Name
             for s1_id in self.exact_name.lookup(qname):
                 c = get_cand(s1_id)
-                c["by_exact_name"] = 1
+                if c is not None:
+                    c["by_exact_name"] = 1
                 
             # 2. Exact Address
             for s1_id in self.exact_addr.lookup(qaddr):
                 c = get_cand(s1_id)
-                c["by_exact_address"] = 1
+                if c is not None:
+                    c["by_exact_address"] = 1
                 
             # 3. Exact Combined
             for s1_id in self.exact_comb.lookup(qcomb):
                 c = get_cand(s1_id)
-                c["by_exact_combined"] = 1
+                if c is not None:
+                    c["by_exact_combined"] = 1
                 
             # 4. BM25 Name
             for s1_id, sc, rk in bm25_name_res[idx]:
                 c = get_cand(s1_id)
-                c["by_bm25_name"] = 1
-                c["bm25_name_score"] = max(c["bm25_name_score"], sc)
-                c["bm25_name_rank"] = min(c["bm25_name_rank"], rk)
+                if c is not None:
+                    c["by_bm25_name"] = 1
+                    c["bm25_name_score"] = max(c["bm25_name_score"], sc)
+                    c["bm25_name_rank"] = min(c["bm25_name_rank"], rk)
                 
             # 5. BM25 Combined
             for s1_id, sc, rk in bm25_comb_res[idx]:
                 c = get_cand(s1_id)
-                c["by_bm25_combined"] = 1
-                c["bm25_comb_score"] = max(c["bm25_comb_score"], sc)
-                c["bm25_comb_rank"] = min(c["bm25_comb_rank"], rk)
+                if c is not None:
+                    c["by_bm25_combined"] = 1
+                    c["bm25_comb_score"] = max(c["bm25_comb_score"], sc)
+                    c["bm25_comb_rank"] = min(c["bm25_comb_rank"], rk)
                 
             # 6. Char TF-IDF Name
             for s1_id, sc, rk in tfidf_name_res[idx]:
                 c = get_cand(s1_id)
-                c["by_tfidf_name"] = 1
-                c["tfidf_name_score"] = max(c["tfidf_name_score"], sc)
-                c["tfidf_name_rank"] = min(c["tfidf_name_rank"], rk)
+                if c is not None:
+                    c["by_tfidf_name"] = 1
+                    c["tfidf_name_score"] = max(c["tfidf_name_score"], sc)
+                    c["tfidf_name_rank"] = min(c["tfidf_name_rank"], rk)
                 
             # 7. Char TF-IDF Address
             for s1_id, sc, rk in tfidf_addr_res[idx]:
                 c = get_cand(s1_id)
-                c["by_tfidf_address"] = 1
-                c["tfidf_addr_score"] = max(c["tfidf_addr_score"], sc)
-                c["tfidf_addr_rank"] = min(c["tfidf_addr_rank"], rk)
+                if c is not None:
+                    c["by_tfidf_address"] = 1
+                    c["tfidf_addr_score"] = max(c["tfidf_addr_score"], sc)
+                    c["tfidf_addr_rank"] = min(c["tfidf_addr_rank"], rk)
                 
             # Calculate composite agreement and reciprocal rank
             for s1_id, c in candidates.items():

@@ -294,9 +294,9 @@ BETA = 0.5
 # Configurable Data Sampling Parameters (Zero Hardcoding)
 # Allows seamless scaling between quick notebook verification and full multi-million row inference
 SAMPLE_S1_ROWS: Optional[int] = int(os.environ.get("SAMPLE_S1_ROWS", 25000)) if os.environ.get("SAMPLE_S1_ROWS", "25000") != "0" else None
-SAMPLE_QUERY_ROWS: Optional[int] = int(os.environ.get("SAMPLE_QUERY_ROWS", 20000)) if os.environ.get("SAMPLE_QUERY_ROWS", "20000") != "0" else None
-SAMPLE_ACTIVE_QUERIES: Optional[int] = int(os.environ.get("SAMPLE_ACTIVE_QUERIES", 10000)) if os.environ.get("SAMPLE_ACTIVE_QUERIES", "10000") != "0" else None
-MAX_TEST_QUERIES: Optional[int] = int(os.environ.get("MAX_TEST_QUERIES", 10000)) if os.environ.get("MAX_TEST_QUERIES", "10000") != "0" else None
+SAMPLE_QUERY_ROWS: Optional[int] = int(os.environ.get("SAMPLE_QUERY_ROWS", 25000)) if os.environ.get("SAMPLE_QUERY_ROWS", "25000") != "0" else None
+SAMPLE_ACTIVE_QUERIES: Optional[int] = int(os.environ.get("SAMPLE_ACTIVE_QUERIES", 25000)) if os.environ.get("SAMPLE_ACTIVE_QUERIES", "25000") != "0" else None
+MAX_TEST_QUERIES: Optional[int] = int(os.environ.get("MAX_TEST_QUERIES", 0)) if os.environ.get("MAX_TEST_QUERIES", "0") not in ("0", "none", "None", "") else None
 
 
 def save_threshold_config(

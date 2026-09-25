@@ -14,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.config import (
     TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GROUND_TRUTH_PATH, RESULTS_DIR
 )
-from src.data_loader import load_source_tsv, load_ground_truth
+from src.data_loader import load_source_tsv, load_ground_truth, load_coherent_training_sample
 from src.normalization import create_normalized_features
 from src.candidate_generation import CandidateGenerator
 from src.features import extract_candidate_features
@@ -26,7 +26,7 @@ from src.experiments import create_entity_level_split
 def main():
     parser = argparse.ArgumentParser(description="Train Entity Matching Model")
     parser.add_argument("--sample-s1", type=int, default=25000, help="S1 reference entities sample size")
-    parser.add_argument("--sample-queries", type=int, default=10000, help="Query records sample size")
+    parser.add_argument("--sample-queries", type=int, default=20000, help="Query records sample size")
     parser.add_argument("--val-ratio", type=float, default=0.20, help="Validation S1 entity ratio")
     parser.add_argument("--max-negatives", type=int, default=8, help="Max negatives per positive")
     args = parser.parse_args()
@@ -35,20 +35,17 @@ def main():
     print(f"[TRAIN MODEL] Entity-Level Split Training (S1: {args.sample_s1:,}, Queries: {args.sample_queries:,})")
     print("=" * 60)
     
-    # 1. Load data
-    s1_df = pd.read_csv(TRAIN_S1_PATH, sep="\t", nrows=args.sample_s1, keep_default_na=False, dtype=str)
-    gt_df, s1_to_matches, _ = load_ground_truth(TRAIN_GROUND_TRUTH_PATH)
-    
-    s1_sample_ids = set(s1_df["entity_id"])
-    active_gt = {s1: s1_to_matches.get(s1, set()) for s1 in s1_sample_ids}
-    needed_q_ids = set()
-    for q_set in active_gt.values():
-        needed_q_ids.update(q_set)
-        
-    s2_df = pd.read_csv(TRAIN_S2_PATH, sep="\t", nrows=args.sample_queries * 2, keep_default_na=False, dtype=str)
-    s3_df = pd.read_csv(TRAIN_S3_PATH, sep="\t", nrows=args.sample_queries * 2, keep_default_na=False, dtype=str)
-    query_df = pd.concat([s2_df, s3_df], ignore_index=True)
-    query_df = query_df[query_df["entity_id"].isin(needed_q_ids) | (query_df.index < args.sample_queries)].head(args.sample_queries).reset_index(drop=True)
+    # 1. Load coherent training sample
+    s1_df, query_df, active_gt = load_coherent_training_sample(
+        s1_path=TRAIN_S1_PATH,
+        gt_path=TRAIN_GROUND_TRUTH_PATH,
+        s2_path=TRAIN_S2_PATH,
+        s3_path=TRAIN_S3_PATH,
+        sample_s1_rows=args.sample_s1,
+        max_active_queries=args.sample_queries,
+        num_unmatched_queries=2000,
+        random_seed=42
+    )
     
     # 2. Normalize
     s1_df = create_normalized_features(s1_df)

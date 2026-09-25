@@ -99,15 +99,19 @@ class CharTFIDFRetriever:
             q_matrix = self.vectorizer.transform(q_batch)
             # Dot product against transposed corpus: (batch_size x corpus_size)
             scores_batch = q_matrix.dot(self.corpus_matrix_T)
+            indptr = scores_batch.indptr
+            s_data = scores_batch.data
+            s_indices = scores_batch.indices
             
             for row_idx in range(scores_batch.shape[0]):
-                row = scores_batch.getrow(row_idx)
-                if row.nnz == 0:
+                start = indptr[row_idx]
+                end = indptr[row_idx + 1]
+                if start == end:
                     results.append([])
                     continue
                 
-                data = row.data
-                indices = row.indices
+                data = s_data[start:end]
+                indices = s_indices[start:end]
                 
                 if len(data) <= top_k:
                     order = np.argsort(-data)
@@ -217,15 +221,19 @@ class SparseBM25Retriever:
             
             # Sparse dot product
             scores_batch = q_matrix.dot(self.bm25_matrix_T)
+            indptr = scores_batch.indptr
+            s_data = scores_batch.data
+            s_indices = scores_batch.indices
             
             for row_idx in range(scores_batch.shape[0]):
-                row = scores_batch.getrow(row_idx)
-                if row.nnz == 0:
+                start = indptr[row_idx]
+                end = indptr[row_idx + 1]
+                if start == end:
                     results.append([])
                     continue
                 
-                data = row.data
-                indices = row.indices
+                data = s_data[start:end]
+                indices = s_indices[start:end]
                 
                 if len(data) <= top_k:
                     order = np.argsort(-data)

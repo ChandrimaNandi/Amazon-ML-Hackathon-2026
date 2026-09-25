@@ -13,9 +13,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import (
     TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GROUND_TRUTH_PATH,
-    TEST_DIR, SUBMISSION_MATCHING_PATH, SUBMISSION_CANDIDATE_PATH, RESULTS_DIR
+    TEST_DIR, SUBMISSION_MATCHING_PATH, SUBMISSION_CANDIDATE_PATH, RESULTS_DIR,
+    load_threshold_config
 )
-from src.data_loader import load_source_tsv, load_ground_truth
+from src.data_loader import load_source_tsv, load_ground_truth, load_coherent_training_sample
 from src.normalization import create_normalized_features
 from src.candidate_generation import CandidateGenerator
 from src.features import extract_candidate_features
@@ -39,21 +40,17 @@ def main():
         print(f"Loading pre-trained model from {model_path}...")
         model = EntityMatcherModel.load_model(model_path)
     else:
-        print("Training model on representative training sample...")
-        s1_df = pd.read_csv(TRAIN_S1_PATH, sep="\t", nrows=25000, keep_default_na=False, dtype=str)
-        gt_df, s1_to_matches, _ = load_ground_truth(TRAIN_GROUND_TRUTH_PATH)
-        
-        s1_sample_ids = set(s1_df["entity_id"])
-        active_gt = {s1: s1_to_matches.get(s1, set()) for s1 in s1_sample_ids}
-        needed_q_ids = set()
-        for q_set in active_gt.values():
-            needed_q_ids.update(q_set)
-            
-        s2_df = pd.read_csv(TRAIN_S2_PATH, sep="\t", nrows=20000, keep_default_na=False, dtype=str)
-        s3_df = pd.read_csv(TRAIN_S3_PATH, sep="\t", nrows=20000, keep_default_na=False, dtype=str)
-        query_df = pd.concat([s2_df, s3_df], ignore_index=True)
-        query_df = query_df[query_df["entity_id"].isin(needed_q_ids) | (query_df.index < 10000)].head(10000).reset_index(drop=True)
-        
+        print("Training model on coherent training sample...")
+        s1_df, query_df, active_gt = load_coherent_training_sample(
+            s1_path=TRAIN_S1_PATH,
+            gt_path=TRAIN_GROUND_TRUTH_PATH,
+            s2_path=TRAIN_S2_PATH,
+            s3_path=TRAIN_S3_PATH,
+            sample_s1_rows=25000,
+            max_active_queries=25000,
+            num_unmatched_queries=2000,
+            random_seed=42
+        )
         s1_df = create_normalized_features(s1_df)
         query_df = create_normalized_features(query_df)
         

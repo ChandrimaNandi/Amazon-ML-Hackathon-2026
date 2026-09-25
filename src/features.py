@@ -22,10 +22,58 @@ import numpy as np
 from typing import Dict, List, Set, Tuple, Optional, Any
 import logging
 
+import re
 from src.similarity import compute_string_similarities
 from src.profiling import detect_script
 
 logger = logging.getLogger(__name__)
+
+US_STATES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+    "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+    "VA","WA","WV","WI","WY","DC"
+}
+GENERIC_BUSINESS_WORDS = {
+    "inc", "corp", "llc", "ltd", "group", "co", "company", "school", "public",
+    "center", "services", "service", "pvt", "limited", "optical", "studio",
+    "care", "international", "holding", "holdings", "the", "and", "of", "in"
+}
+
+
+def extract_us_state(addr: str) -> Optional[str]:
+    """Extracts 2-letter US state code from address string if present."""
+    if not addr:
+        return None
+    tokens = re.findall(r"\b([A-Za-z]{2})\b", addr.upper())
+    for t in reversed(tokens):
+        if t in US_STATES:
+            return t
+    return None
+
+
+def check_acronym_match(q_name: str, s1_name: str) -> int:
+    """Checks if query name is an acronym for the multi-word S1 business name."""
+    if not q_name or not s1_name:
+        return 0
+    q_clean = "".join(re.findall(r"[A-Za-z]", q_name.upper()))
+    if 2 <= len(q_clean) <= 6:
+        words = [w for w in re.findall(r"[A-Za-z]+", s1_name.upper()) if w.lower() not in GENERIC_BUSINESS_WORDS]
+        initials = "".join(w[0] for w in words if w)
+        if q_clean == initials or (len(q_clean) >= 2 and q_clean == initials[:len(q_clean)]):
+            return 1
+    return 0
+
+
+def check_distinct_name_mismatch(q_norm: str, s1_norm: str) -> int:
+    """Checks if distinctive non-generic tokens in the two names completely disagree."""
+    if not q_norm or not s1_norm:
+        return 0
+    q_words = {w for w in q_norm.split() if w not in GENERIC_BUSINESS_WORDS and len(w) > 1}
+    s1_words = {w for w in s1_norm.split() if w not in GENERIC_BUSINESS_WORDS and len(w) > 1}
+    if q_words and s1_words and not (q_words & s1_words):
+        return 1
+    return 0
 
 
 FEATURE_COLUMNS = [
@@ -60,7 +108,10 @@ FEATURE_COLUMNS = [
     "script_match", "script_mismatch",
     
     # Missing Field & Source Indicators
-    "query_is_s2", "missing_name_q", "missing_addr_q", "missing_name_s1", "missing_addr_s1"
+    "query_is_s2", "missing_name_q", "missing_addr_q", "missing_name_s1", "missing_addr_s1",
+    
+    # High-Precision Disambiguation Signals
+    "is_acronym_match", "distinct_name_mismatch", "us_state_mismatch", "missing_addr_penalty"
 ]
 
 
@@ -258,6 +309,19 @@ def extract_candidate_features(
             "missing_addr_q": m_addr_q,
             "missing_name_s1": m_name_s1,
             "missing_addr_s1": m_addr_s1,
+            
+            # High-Precision Disambiguation Signals
+            "is_acronym_match": check_acronym_match(q_info["name_raw"], s1_info["name_raw"]),
+            "distinct_name_mismatch": check_distinct_name_mismatch(qn_norm, s1n_norm),
+            "us_state_mismatch": (
+                1 if (
+                    q_info["country"].upper() == "US" and s1_info["country"].upper() == "US"
+                    and extract_us_state(q_info["addr_raw"])
+                    and extract_us_state(s1_info["addr_raw"])
+                    and extract_us_state(q_info["addr_raw"]) != extract_us_state(s1_info["addr_raw"])
+                ) else 0
+            ),
+            "missing_addr_penalty": 1 if ((m_addr_q ^ m_addr_s1) == 1) else 0,
         }
         
         if s1_to_matches is not None:
