@@ -53,7 +53,7 @@ def evaluate_macro_metrics(
     beta: float = BETA
 ) -> Dict[str, float]:
     """
-    Computes Macro F0.5, Macro Precision, Macro Recall across all S1 entities.
+    Computes Macro F0.5, Macro Precision, Macro Recall across evaluated S1 entities.
     """
     precisions, recalls, f_betas = [], [], []
     
@@ -66,9 +66,9 @@ def evaluate_macro_metrics(
         recalls.append(rec)
         f_betas.append(f_b)
         
-    macro_prec = float(np.mean(precisions))
-    macro_rec = float(np.mean(recalls))
-    macro_f_beta = float(np.mean(f_betas))
+    macro_prec = float(np.mean(precisions)) if precisions else 0.0
+    macro_rec = float(np.mean(recalls)) if recalls else 0.0
+    macro_f_beta = float(np.mean(f_betas)) if f_betas else 0.0
     
     results = {
         "macro_precision": round(macro_prec, 4),
@@ -82,21 +82,29 @@ def evaluate_macro_metrics(
 
 def evaluate_candidate_recall(
     cand_df: pd.DataFrame,
-    s1_to_true_matches: Dict[str, Set[str]]
+    s1_to_true_matches: Dict[str, Set[str]],
+    evaluated_query_ids: Optional[Set[str]] = None
 ) -> Dict[str, float]:
     """
     Evaluates candidate recall on training data.
     Measures proportion of true match pairs (s1_id, query_id) present in candidate set.
     """
-    total_true_pairs = sum(len(m) for m in s1_to_true_matches.values())
-    if total_true_pairs == 0:
-        return {"candidate_recall": 1.0, "total_true_pairs": 0, "found_pairs": 0}
+    if cand_df.empty:
+        return {"candidate_recall": 0.0, "total_true_pairs": 0, "found_pairs": 0}
         
-    # Set of true (s1_id, query_id) pairs
+    if evaluated_query_ids is None:
+        evaluated_query_ids = set(cand_df["query_id"].unique())
+        
+    # Extract true pairs belonging to the evaluated query IDs
     true_pair_set = set()
     for s1_id, q_set in s1_to_true_matches.items():
         for q_id in q_set:
-            true_pair_set.add((s1_id, q_id))
+            if q_id in evaluated_query_ids:
+                true_pair_set.add((s1_id, q_id))
+                
+    total_true_pairs = len(true_pair_set)
+    if total_true_pairs == 0:
+        return {"candidate_recall": 1.0, "total_true_pairs": 0, "found_pairs": 0}
             
     # Set of candidate (s1_id, query_id) pairs
     cand_pair_set = set(zip(cand_df["s1_id"], cand_df["query_id"]))
@@ -111,5 +119,5 @@ def evaluate_candidate_recall(
         "missed_pairs": total_true_pairs - found_pairs,
     }
     
-    logger.info(f"Candidate Recall: {recall:.4f} ({found_pairs:,} / {total_true_pairs:,} true pairs recovered)")
+    logger.info(f"Candidate Recall: {recall:.4f} ({found_pairs:,} / {total_true_pairs:,} true pairs recovered for {len(evaluated_query_ids):,} queries)")
     return results

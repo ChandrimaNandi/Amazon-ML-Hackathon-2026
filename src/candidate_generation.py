@@ -1,6 +1,7 @@
 """
 Candidate Generation Module for Business Entity Resolution.
 Combines multiple retrieval channels into a unified candidate set per query record.
+Supports fast scalable retrieval for multi-million query test sets.
 """
 
 import time
@@ -55,32 +56,39 @@ def generate_candidate_union(
         if addr:
             exact_addr_map.setdefault(addr, set()).add(s1_id)
             
+    is_large_scale = len(query_df) > 500000
+    
     # 1. Fit Retrievers
-    # BM25 Name & Combined
-    bm25_name = BM25Retriever()
-    bm25_name.fit(s1_df["name_normalized"].tolist(), s1_ids)
-    
-    bm25_combined = BM25Retriever()
-    bm25_combined.fit(s1_df["combined_normalized"].tolist(), s1_ids)
-    
-    # Char-TFIDF Name & Address
+    # Char-TFIDF Name & Address (Ultra-fast GPU/sparse dot product)
     char_name = CharTFIDFRetriever()
     char_name.fit(s1_df["name_normalized"].tolist(), s1_ids)
     
     char_addr = CharTFIDFRetriever()
     char_addr.fit(s1_df["address_normalized"].tolist(), s1_ids)
     
-    # 2. Perform Retrieval for Queries
-    bm25_name_res = bm25_name.retrieve_top_k(query_df["name_normalized"].tolist(), top_k=k_name)
-    bm25_comb_res = bm25_combined.retrieve_top_k(query_df["combined_normalized"].tolist(), top_k=k_combined)
     char_name_res = char_name.retrieve_top_k(query_df["name_normalized"].tolist(), top_k=k_char)
     char_addr_res = char_addr.retrieve_top_k(query_df["address_normalized"].tolist(), top_k=k_address)
     
+    bm25_name_res = [[] for _ in range(len(query_df))]
+    bm25_comb_res = [[] for _ in range(len(query_df))]
+    
+    if not is_large_scale:
+        # On smaller training/validation sets, also run BM25 for extra coverage
+        bm25_name = BM25Retriever()
+        bm25_name.fit(s1_df["name_normalized"].tolist(), s1_ids)
+        
+        bm25_combined = BM25Retriever()
+        bm25_combined.fit(s1_df["combined_normalized"].tolist(), s1_ids)
+        
+        bm25_name_res = bm25_name.retrieve_top_k(query_df["name_normalized"].tolist(), top_k=k_name)
+        bm25_comb_res = bm25_combined.retrieve_top_k(query_df["combined_normalized"].tolist(), top_k=k_combined)
+    else:
+        logger.info("Large query dataset detected (>500k records). Utilizing Ultra-Fast Char-TFIDF & Exact Match retrieval.")
+
     # 3. Candidate Assembly
     candidate_records = []
     
     for idx, (q_id, q_name, q_addr) in enumerate(zip(query_ids, query_df["name_normalized"], query_df["address_normalized"])):
-        # Storage for candidate details: s1_id -> info dict
         candidates: Dict[str, Dict[str, Any]] = {}
         
         def get_cand(s1_id: str) -> Dict[str, Any]:

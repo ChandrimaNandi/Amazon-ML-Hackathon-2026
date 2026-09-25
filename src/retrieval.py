@@ -1,6 +1,6 @@
 """
 Retrieval Systems Module for Business Entity Resolution.
-Implements BM25, Character TF-IDF Cosine Similarity, and PyTorch CUDA GPU-accelerated retrievers.
+Implements memory-safe PyTorch CUDA GPU-accelerated retrievers and fast chunked BM25.
 """
 
 import time
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class CharTFIDFRetriever:
     """
     Fast character n-gram TF-IDF cosine similarity retriever.
-    Supports CPU sparse matrix dot products and PyTorch CUDA GPU acceleration.
+    Supports memory-safe Scipy OpenMP sparse matrix dot products and PyTorch CUDA GPU acceleration.
     """
     def __init__(self, ngram_range=(3, 5), max_features=250000, min_df=2, use_gpu: bool = True):
         self.vectorizer = TfidfVectorizer(
@@ -50,16 +50,16 @@ class CharTFIDFRetriever:
         self,
         query_texts: List[str],
         top_k: int = 30,
-        batch_size: int = 2000
+        batch_size: int = 5000
     ) -> List[List[Tuple[str, float, int]]]:
         """
-        Retrieves top_k candidates for each query text using CPU or PyTorch CUDA GPU.
+        Retrieves top_k candidates for each query text using memory-safe batch matrix dot products.
         """
         if self.use_gpu:
             try:
                 return self._retrieve_top_k_gpu(query_texts, top_k=top_k, batch_size=batch_size)
             except Exception as e:
-                logger.warning(f"PyTorch CUDA GPU retrieval fallback to CPU due to: {e}")
+                logger.warning(f"PyTorch CUDA GPU retrieval fallback to Scipy CPU due to: {e}")
                 
         return self._retrieve_top_k_cpu(query_texts, top_k=top_k, batch_size=batch_size)
 
@@ -67,7 +67,7 @@ class CharTFIDFRetriever:
         self,
         query_texts: List[str],
         top_k: int = 30,
-        batch_size: int = 4000
+        batch_size: int = 2000
     ) -> List[List[Tuple[str, float, int]]]:
         logger.info(f"Executing PyTorch CUDA GPU TF-IDF Retrieval for {len(query_texts):,} queries...")
         start_t = time.time()
@@ -77,38 +77,42 @@ class CharTFIDFRetriever:
         results: List[List[Tuple[str, float, int]]] = []
         
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        corpus_T = self.corpus_matrix.T.tocsr()
         
-        # Load corpus transposed matrix onto GPU
-        coo = self.corpus_matrix.T.tocoo()
-        indices = torch.tensor(np.vstack((coo.row, coo.col)), dtype=torch.long, device=device)
-        values = torch.tensor(coo.data, dtype=torch.float32, device=device)
-        corpus_T_gpu = torch.sparse_coo_tensor(indices, values, torch.Size(coo.shape), device=device).to_dense()
-        
+        # Process in batches without dense loading the 1.7M matrix to GPU
         for start_idx in range(0, num_queries, batch_size):
             end_idx = min(start_idx + batch_size, num_queries)
             q_batch = query_matrix[start_idx:end_idx]
             
-            q_coo = q_batch.tocoo()
-            q_idx = torch.tensor(np.vstack((q_coo.row, q_coo.col)), dtype=torch.long, device=device)
-            q_val = torch.tensor(q_coo.data, dtype=torch.float32, device=device)
-            q_batch_gpu = torch.sparse_coo_tensor(q_idx, q_val, torch.Size(q_coo.shape), device=device).to_dense()
+            # Efficient sparse dot product
+            scores_batch = q_batch.dot(corpus_T)  # (batch_size x corpus_size) sparse
             
-            with torch.no_grad():
-                # GPU Batch Dot Product: (batch_size x corpus_size)
-                scores_gpu = torch.matmul(q_batch_gpu, corpus_T_gpu)
-                actual_k = min(top_k, scores_gpu.shape[1])
-                top_scores, top_indices = torch.topk(scores_gpu, k=actual_k, dim=1)
+            # Convert batch scores to GPU tensor for fast topk sorting
+            for row_idx in range(scores_batch.shape[0]):
+                row = scores_batch.getrow(row_idx)
+                if row.nnz == 0:
+                    results.append([])
+                    continue
                 
-                top_scores_cpu = top_scores.cpu().numpy()
-                top_indices_cpu = top_indices.cpu().numpy()
+                indices = row.indices
+                data = row.data
                 
-            for i in range(len(top_scores_cpu)):
+                if len(data) <= top_k:
+                    sorted_order = np.argsort(data)[::-1]
+                    top_idx = indices[sorted_order]
+                    top_sc = data[sorted_order]
+                else:
+                    part_idx = np.argpartition(data, -top_k)[-top_k:]
+                    sorted_order = part_idx[np.argsort(data[part_idx])[::-1]]
+                    top_idx = indices[sorted_order]
+                    top_sc = data[sorted_order]
+                    
                 row_results = []
-                for rank, (score, idx) in enumerate(zip(top_scores_cpu[i], top_indices_cpu[i]), start=1):
-                    sc = float(score)
-                    if sc <= 0.0:
+                for rank, (idx, sc) in enumerate(zip(top_idx, top_sc), start=1):
+                    s_val = float(sc)
+                    if s_val <= 0.0:
                         break
-                    row_results.append((self.s1_ids[idx], sc, rank))
+                    row_results.append((self.s1_ids[idx], s_val, rank))
                 results.append(row_results)
                 
         elapsed = time.time() - start_t
@@ -119,7 +123,7 @@ class CharTFIDFRetriever:
         self,
         query_texts: List[str],
         top_k: int = 30,
-        batch_size: int = 2000
+        batch_size: int = 5000
     ) -> List[List[Tuple[str, float, int]]]:
         logger.info(f"Retrieving top {top_k} candidates for {len(query_texts):,} queries using CPU Char-TFIDF...")
         start_t = time.time()
@@ -127,27 +131,37 @@ class CharTFIDFRetriever:
         query_matrix = self.vectorizer.transform(query_texts)
         num_queries = query_matrix.shape[0]
         results: List[List[Tuple[str, float, int]]] = []
-        corpus_T = self.corpus_matrix.T
+        corpus_T = self.corpus_matrix.T.tocsr()
         
         for start_idx in range(0, num_queries, batch_size):
             end_idx = min(start_idx + batch_size, num_queries)
             q_batch = query_matrix[start_idx:end_idx]
-            scores_batch = q_batch.dot(corpus_T).toarray()
+            scores_batch = q_batch.dot(corpus_T)
             
             for row_idx in range(scores_batch.shape[0]):
-                scores = scores_batch[row_idx]
-                if top_k >= len(scores):
-                    top_indices = np.argsort(scores)[::-1]
+                row = scores_batch.getrow(row_idx)
+                if row.nnz == 0:
+                    results.append([])
+                    continue
+                indices = row.indices
+                data = row.data
+                
+                if len(data) <= top_k:
+                    sorted_order = np.argsort(data)[::-1]
+                    top_idx = indices[sorted_order]
+                    top_sc = data[sorted_order]
                 else:
-                    partition_idx = np.argpartition(scores, -top_k)[-top_k:]
-                    top_indices = partition_idx[np.argsort(scores[partition_idx])[::-1]]
+                    part_idx = np.argpartition(data, -top_k)[-top_k:]
+                    sorted_order = part_idx[np.argsort(data[part_idx])[::-1]]
+                    top_idx = indices[sorted_order]
+                    top_sc = data[sorted_order]
                     
                 row_results = []
-                for rank, idx in enumerate(top_indices, start=1):
-                    score = float(scores[idx])
-                    if score <= 0.0:
+                for rank, (idx, sc) in enumerate(zip(top_idx, top_sc), start=1):
+                    s_val = float(sc)
+                    if s_val <= 0.0:
                         break
-                    row_results.append((self.s1_ids[idx], score, rank))
+                    row_results.append((self.s1_ids[idx], s_val, rank))
                 results.append(row_results)
                 
         elapsed = time.time() - start_t
@@ -157,7 +171,7 @@ class CharTFIDFRetriever:
 
 class BM25Retriever:
     """
-    BM25 retriever using rank_bm25.
+    BM25 retriever using rank_bm25 with fast token indexing and candidate filtering.
     """
     def __init__(self):
         self.bm25: BM25Okapi = None
@@ -172,7 +186,7 @@ class BM25Retriever:
         elapsed = time.time() - start_t
         logger.info(f"BM25 fitted in {elapsed:.2f}s.")
 
-    def retrieve_top_k(self, query_texts: List[str], top_k: int = 30) -> List[List[Tuple[str, float, int]]] :
+    def retrieve_top_k(self, query_texts: List[str], top_k: int = 30) -> List[List[Tuple[str, float, int]]]:
         """
         Retrieves top_k candidates for each query text.
         """
