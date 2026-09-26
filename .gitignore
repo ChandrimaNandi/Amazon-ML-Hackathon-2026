@@ -23,3 +23,5 @@ output/
 
 # OS
 .DS_Store
+
+fast_hybrid_er/*

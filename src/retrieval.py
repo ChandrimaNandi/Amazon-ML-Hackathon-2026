@@ -16,6 +16,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from typing import Dict, List, Tuple, Set, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
 import logging
 
 try:
@@ -83,6 +84,7 @@ class CharTFIDFRetriever:
         """
         Retrieves top_k reference entities for each query text.
         Returns list of [(s1_id, cosine_score, rank), ...] per query.
+        Uses multi-threaded batch processing across CPU cores.
         """
         num_queries = len(query_texts)
         if top_k <= 0 or num_queries == 0:
@@ -94,23 +96,22 @@ class CharTFIDFRetriever:
         results: List[List[Tuple[str, float, int]]] = []
         start_t = time.time()
         
-        for start_idx in range(0, num_queries, batch_size):
-            end_idx = min(start_idx + batch_size, num_queries)
-            q_batch = query_texts[start_idx:end_idx]
-            
-            # Sparse batch transform
+        n_workers = min(4, os.cpu_count() or 1)
+        batches = [query_texts[i:i + batch_size] for i in range(0, num_queries, batch_size)]
+        
+        def _process_batch(q_batch):
             q_matrix = self.vectorizer.transform(q_batch)
-            # Dot product against transposed corpus: (batch_size x corpus_size)
             scores_batch = q_matrix.dot(self.corpus_matrix_T)
             indptr = scores_batch.indptr
             s_data = scores_batch.data
             s_indices = scores_batch.indices
             
+            b_results = []
             for row_idx in range(scores_batch.shape[0]):
                 start = indptr[row_idx]
                 end = indptr[row_idx + 1]
                 if start == end:
-                    results.append([])
+                    b_results.append([])
                     continue
                 
                 data = s_data[start:end]
@@ -128,7 +129,16 @@ class CharTFIDFRetriever:
                     if sc <= 0.001:
                         break
                     row_cands.append((self.s1_ids[indices[j]], sc, rank))
-                results.append(row_cands)
+                b_results.append(row_cands)
+            return b_results
+            
+        if n_workers > 1 and len(batches) > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                for b_res in executor.map(_process_batch, batches):
+                    results.extend(b_res)
+        else:
+            for b in batches:
+                results.extend(_process_batch(b))
                 
         elapsed = time.time() - start_t
         logger.info(f"[RETRIEVAL] Char-TFIDF retrieved top-{top_k} for {num_queries:,} queries in {elapsed:.2f}s ({num_queries/max(elapsed, 0.001):.0f} q/s)")
@@ -249,6 +259,7 @@ class SparseBM25Retriever:
         """
         Retrieves top_k reference entities for each query text using BM25 scoring.
         Returns list of [(s1_id, bm25_score, rank), ...] per query.
+        Uses multi-threaded batch processing across CPU cores.
         """
         num_queries = len(query_texts)
         if top_k <= 0 or num_queries == 0:
@@ -260,25 +271,23 @@ class SparseBM25Retriever:
         results: List[List[Tuple[str, float, int]]] = []
         start_t = time.time()
         
-        for start_idx in range(0, num_queries, batch_size):
-            end_idx = min(start_idx + batch_size, num_queries)
-            q_batch = query_texts[start_idx:end_idx]
-            
-            # Binary term occurrence in query
+        n_workers = min(4, os.cpu_count() or 1)
+        batches = [query_texts[i:i + batch_size] for i in range(0, num_queries, batch_size)]
+        
+        def _process_batch(q_batch):
             q_matrix = self.vectorizer.transform(q_batch)
             q_matrix.data = np.ones_like(q_matrix.data, dtype=np.float32)
-            
-            # Sparse dot product
             scores_batch = q_matrix.dot(self.bm25_matrix_T)
             indptr = scores_batch.indptr
             s_data = scores_batch.data
             s_indices = scores_batch.indices
             
+            b_results = []
             for row_idx in range(scores_batch.shape[0]):
                 start = indptr[row_idx]
                 end = indptr[row_idx + 1]
                 if start == end:
-                    results.append([])
+                    b_results.append([])
                     continue
                 
                 data = s_data[start:end]
@@ -287,8 +296,6 @@ class SparseBM25Retriever:
                 if len(data) <= top_k:
                     order = np.argsort(-data)
                 elif len(data) > 2000:
-                    # When candidate list is large, threshold to candidates with score > 0.2
-                    # to keep argpartition fast and avoid multi-second pure-Python bottlenecks
                     mask = data > 0.2
                     if np.count_nonzero(mask) >= top_k:
                         sub_data = data[mask]
@@ -301,7 +308,7 @@ class SparseBM25Retriever:
                             if sc <= 0.001:
                                 break
                             row_cands.append((self.s1_ids[sub_indices[j]], sc, rank))
-                        results.append(row_cands)
+                        b_results.append(row_cands)
                         continue
                     else:
                         part = np.argpartition(data, -top_k)[-top_k:]
@@ -316,7 +323,16 @@ class SparseBM25Retriever:
                     if sc <= 0.001:
                         break
                     row_cands.append((self.s1_ids[indices[j]], sc, rank))
-                results.append(row_cands)
+                b_results.append(row_cands)
+            return b_results
+            
+        if n_workers > 1 and len(batches) > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                for b_res in executor.map(_process_batch, batches):
+                    results.extend(b_res)
+        else:
+            for b in batches:
+                results.extend(_process_batch(b))
                 
         elapsed = time.time() - start_t
         logger.info(f"[RETRIEVAL] Sparse BM25 retrieved top-{top_k} for {num_queries:,} queries in {elapsed:.2f}s ({num_queries/max(elapsed, 0.001):.0f} q/s)")

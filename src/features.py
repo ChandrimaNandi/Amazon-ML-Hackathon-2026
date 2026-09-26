@@ -22,7 +22,9 @@ import numpy as np
 from typing import Dict, List, Set, Tuple, Optional, Any
 import logging
 
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from src.similarity import compute_string_similarities
 from src.profiling import detect_script
 
@@ -151,18 +153,23 @@ def extract_candidate_features(
     s1_sub = s1_df[s1_df["entity_id"].isin(needed_s1)]
     q_sub = query_df[query_df["entity_id"].isin(needed_q)]
     
-    # Build fast lookup dictionaries
+    # Build fast lookup dictionaries with pre-cached script and US state signals
     def build_lookup(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
         lookup = {}
         for row in df.itertuples():
+            n_raw = getattr(row, "business_name", "")
+            a_raw = getattr(row, "business_address", "")
+            c = getattr(row, "country", "").strip()
             lookup[row.entity_id] = {
-                "name_raw": getattr(row, "business_name", ""),
-                "addr_raw": getattr(row, "business_address", ""),
+                "name_raw": n_raw,
+                "addr_raw": a_raw,
                 "name_norm": getattr(row, "name_normalized", ""),
                 "addr_norm": getattr(row, "address_normalized", ""),
                 "name_trans": getattr(row, "name_transliterated", ""),
                 "addr_trans": getattr(row, "address_transliterated", ""),
-                "country": getattr(row, "country", "").strip(),
+                "country": c,
+                "script": detect_script(n_raw),
+                "state": extract_us_state(a_raw) if c.upper() == "US" else None,
             }
         return lookup
         
@@ -171,164 +178,182 @@ def extract_candidate_features(
     
     default_record = {
         "name_raw": "", "addr_raw": "", "name_norm": "", "addr_norm": "",
-        "name_trans": "", "addr_trans": "", "country": ""
+        "name_trans": "", "addr_trans": "", "country": "", "script": "Empty", "state": None
     }
     
-    feature_rows = []
-    
-    for row in candidate_df.itertuples():
-        qid = row.query_id
-        s1id = row.s1_id
-        
-        q_info = q_data.get(qid, default_record)
-        s1_info = s1_data.get(s1id, default_record)
-        
-        # Name similarities
-        qn_norm = q_info["name_norm"]
-        s1n_norm = s1_info["name_norm"]
-        n_lev, n_jw, n_ratio, n_part, n_tsort, n_tset, n_diff, n_len_ratio, n_overlap, n_tdiff = compute_string_similarities(qn_norm, s1n_norm)
-        
-        # Address similarities
-        qa_norm = q_info["addr_norm"]
-        s1a_norm = s1_info["addr_norm"]
-        a_lev, a_jw, a_ratio, a_part, a_tsort, a_tset, a_diff, a_len_ratio, a_overlap, a_tdiff = compute_string_similarities(qa_norm, s1a_norm)
-        
-        # Transliterated similarities (for multilingual / cross-script pairs)
-        qn_trans = q_info["name_trans"]
-        s1n_trans = s1_info["name_trans"]
-        n_trans_lev, _, _, _, _, _, _, _, _, _ = compute_string_similarities(qn_trans, s1n_trans)
-        
-        qa_trans = q_info["addr_trans"]
-        s1a_trans = s1_info["addr_trans"]
-        a_trans_lev, _, _, _, _, _, _, _, _, _ = compute_string_similarities(qa_trans, s1a_trans)
-        
-        # Combined similarities
-        q_comb = (qn_norm + " " + qa_norm).strip()
-        s1_comb = (s1n_norm + " " + s1a_norm).strip()
-        _, _, _, _, _, comb_tset, _, _, _, _ = compute_string_similarities(q_comb, s1_comb)
-        
-        # Weighted composite similarity
-        weighted_sim = 0.55 * n_jw + 0.35 * a_jw + 0.10 * comb_tset
-        
-        # Country features (soft, open-set friendly)
-        q_country = q_info["country"]
-        s1_country = s1_info["country"]
-        c_missing = 1 if (not q_country or not s1_country) else 0
-        c_match = 1 if (not c_missing and q_country.casefold() == s1_country.casefold()) else 0
-        c_mismatch = 1 if (not c_missing and q_country.casefold() != s1_country.casefold()) else 0
-        
-        # Script features (soft, never hard reject)
-        q_script = detect_script(q_info["name_raw"])
-        s1_script = detect_script(s1_info["name_raw"])
-        script_match = 1 if (q_script == s1_script and q_script != "Empty") else 0
-        script_mismatch = 1 if (q_script != s1_script and q_script != "Empty" and s1_script != "Empty") else 0
-        
-        # Missing field & source indicators
-        is_s2 = 1 if qid.startswith("S2-") else 0
-        m_name_q = 1 if not q_info["name_raw"] else 0
-        m_addr_q = 1 if not q_info["addr_raw"] else 0
-        m_name_s1 = 1 if not s1_info["name_raw"] else 0
-        m_addr_s1 = 1 if not s1_info["addr_raw"] else 0
-        
-        # Exact match indicators
-        ex_name_raw = 1 if (q_info["name_raw"] and q_info["name_raw"] == s1_info["name_raw"]) else 0
-        ex_name_norm = 1 if (qn_norm and qn_norm == s1n_norm) else 0
-        ex_addr_raw = 1 if (q_info["addr_raw"] and q_info["addr_raw"] == s1_info["addr_raw"]) else 0
-        ex_addr_norm = 1 if (qa_norm and qa_norm == s1a_norm) else 0
-        ex_comb_norm = 1 if (q_comb and q_comb == s1_comb) else 0
-        
-        feat = {
-            "query_id": qid,
-            "s1_id": s1id,
+    tuples_list = list(candidate_df.itertuples())
+    n_tuples = len(tuples_list)
+    n_workers = min(4, os.cpu_count() or 1)
+
+    def _process_slice(sub_tuples):
+        rows = []
+        for row in sub_tuples:
+            qid = row.query_id
+            s1id = row.s1_id
             
-            # Retrieval Channels
-            "by_exact_name": getattr(row, "by_exact_name", 0),
-            "by_exact_address": getattr(row, "by_exact_address", 0),
-            "by_exact_combined": getattr(row, "by_exact_combined", 0),
-            "by_bm25_name": getattr(row, "by_bm25_name", 0),
-            "bm25_name_score": getattr(row, "bm25_name_score", 0.0),
-            "bm25_name_rank": getattr(row, "bm25_name_rank", 999),
-            "by_bm25_combined": getattr(row, "by_bm25_combined", 0),
-            "bm25_comb_score": getattr(row, "bm25_comb_score", 0.0),
-            "bm25_comb_rank": getattr(row, "bm25_comb_rank", 999),
-            "by_tfidf_name": getattr(row, "by_tfidf_name", 0),
-            "tfidf_name_score": getattr(row, "tfidf_name_score", 0.0),
-            "tfidf_name_rank": getattr(row, "tfidf_name_rank", 999),
-            "by_tfidf_address": getattr(row, "by_tfidf_address", 0),
-            "tfidf_addr_score": getattr(row, "tfidf_addr_score", 0.0),
-            "tfidf_addr_rank": getattr(row, "tfidf_addr_rank", 999),
-            "retrieval_agreement_count": getattr(row, "retrieval_agreement_count", 0),
-            "best_retrieval_rank": getattr(row, "best_retrieval_rank", 999),
-            "best_reciprocal_rank": getattr(row, "best_reciprocal_rank", 0.0),
+            q_info = q_data.get(qid, default_record)
+            s1_info = s1_data.get(s1id, default_record)
             
-            # Exact Matches
-            "exact_name_raw": ex_name_raw,
-            "exact_name_normalized": ex_name_norm,
-            "exact_addr_raw": ex_addr_raw,
-            "exact_addr_normalized": ex_addr_norm,
-            "exact_combined_normalized": ex_comb_norm,
+            # Name similarities
+            qn_norm = q_info["name_norm"]
+            s1n_norm = s1_info["name_norm"]
+            n_lev, n_jw, n_ratio, n_part, n_tsort, n_tset, n_diff, n_len_ratio, n_overlap, n_tdiff = compute_string_similarities(qn_norm, s1n_norm)
             
-            # Name Similarities
-            "name_levenshtein": n_lev,
-            "name_jaro_winkler": n_jw,
-            "name_fuzz_ratio": n_ratio,
-            "name_partial_ratio": n_part,
-            "name_token_sort": n_tsort,
-            "name_token_set": n_tset,
-            "name_char_len_diff": n_diff,
-            "name_char_len_ratio": n_len_ratio,
-            "name_token_overlap": n_overlap,
-            "name_token_count_diff": n_tdiff,
-            "name_translit_lev": n_trans_lev,
+            # Address similarities
+            qa_norm = q_info["addr_norm"]
+            s1a_norm = s1_info["addr_norm"]
+            a_lev, a_jw, a_ratio, a_part, a_tsort, a_tset, a_diff, a_len_ratio, a_overlap, a_tdiff = compute_string_similarities(qa_norm, s1a_norm)
             
-            # Address Similarities
-            "addr_levenshtein": a_lev,
-            "addr_jaro_winkler": a_jw,
-            "addr_fuzz_ratio": a_ratio,
-            "addr_partial_ratio": a_part,
-            "addr_token_sort": a_tsort,
-            "addr_token_set": a_tset,
-            "addr_char_len_diff": a_diff,
-            "addr_char_len_ratio": a_len_ratio,
-            "addr_token_overlap": a_overlap,
-            "addr_token_count_diff": a_tdiff,
-            "addr_translit_lev": a_trans_lev,
+            # Transliterated similarities (for multilingual / cross-script pairs)
+            qn_trans = q_info["name_trans"]
+            s1n_trans = s1_info["name_trans"]
+            n_trans_lev, _, _, _, _, _, _, _, _, _ = compute_string_similarities(qn_trans, s1n_trans)
             
-            # Combined
-            "combined_token_set": comb_tset,
-            "weighted_composite_similarity": weighted_sim,
+            qa_trans = q_info["addr_trans"]
+            s1a_trans = s1_info["addr_trans"]
+            a_trans_lev, _, _, _, _, _, _, _, _, _ = compute_string_similarities(qa_trans, s1a_trans)
             
-            # Metadata
-            "country_exact_match": c_match,
-            "country_mismatch": c_mismatch,
-            "country_missing": c_missing,
-            "script_match": script_match,
-            "script_mismatch": script_mismatch,
-            "query_is_s2": is_s2,
-            "missing_name_q": m_name_q,
-            "missing_addr_q": m_addr_q,
-            "missing_name_s1": m_name_s1,
-            "missing_addr_s1": m_addr_s1,
+            # Combined similarities
+            q_comb = (qn_norm + " " + qa_norm).strip()
+            s1_comb = (s1n_norm + " " + s1a_norm).strip()
+            _, _, _, _, _, comb_tset, _, _, _, _ = compute_string_similarities(q_comb, s1_comb)
             
-            # High-Precision Disambiguation Signals
-            "is_acronym_match": check_acronym_match(q_info["name_raw"], s1_info["name_raw"]),
-            "distinct_name_mismatch": check_distinct_name_mismatch(qn_norm, s1n_norm),
-            "us_state_mismatch": (
-                1 if (
-                    q_info["country"].upper() == "US" and s1_info["country"].upper() == "US"
-                    and extract_us_state(q_info["addr_raw"])
-                    and extract_us_state(s1_info["addr_raw"])
-                    and extract_us_state(q_info["addr_raw"]) != extract_us_state(s1_info["addr_raw"])
-                ) else 0
-            ),
-            "missing_addr_penalty": 1 if ((m_addr_q ^ m_addr_s1) == 1) else 0,
-        }
+            # Weighted composite similarity
+            weighted_sim = 0.55 * n_jw + 0.35 * a_jw + 0.10 * comb_tset
+            
+            # Country features (soft, open-set friendly)
+            q_country = q_info["country"]
+            s1_country = s1_info["country"]
+            c_missing = 1 if (not q_country or not s1_country) else 0
+            c_match = 1 if (not c_missing and q_country.casefold() == s1_country.casefold()) else 0
+            c_mismatch = 1 if (not c_missing and q_country.casefold() != s1_country.casefold()) else 0
+            
+            # Script features (soft, pre-cached)
+            q_script = q_info["script"]
+            s1_script = s1_info["script"]
+            script_match = 1 if (q_script == s1_script and q_script != "Empty") else 0
+            script_mismatch = 1 if (q_script != s1_script and q_script != "Empty" and s1_script != "Empty") else 0
+            
+            # Missing field & source indicators
+            is_s2 = 1 if qid.startswith("S2-") else 0
+            m_name_q = 1 if not q_info["name_raw"] else 0
+            m_addr_q = 1 if not q_info["addr_raw"] else 0
+            m_name_s1 = 1 if not s1_info["name_raw"] else 0
+            m_addr_s1 = 1 if not s1_info["addr_raw"] else 0
+            
+            # Exact match indicators
+            ex_name_raw = 1 if (q_info["name_raw"] and q_info["name_raw"] == s1_info["name_raw"]) else 0
+            ex_name_norm = 1 if (qn_norm and qn_norm == s1n_norm) else 0
+            ex_addr_raw = 1 if (q_info["addr_raw"] and q_info["addr_raw"] == s1_info["addr_raw"]) else 0
+            ex_addr_norm = 1 if (qa_norm and qa_norm == s1a_norm) else 0
+            ex_comb_norm = 1 if (q_comb and q_comb == s1_comb) else 0
+            
+            # High-Precision Disambiguation Signals (using pre-cached US states)
+            q_state = q_info["state"]
+            s1_state = s1_info["state"]
+            us_state_mismatch = 1 if (
+                q_info["country"].upper() == "US" and s1_info["country"].upper() == "US"
+                and q_state and s1_state and q_state != s1_state
+            ) else 0
+            is_acronym = check_acronym_match(q_info["name_raw"], s1_info["name_raw"])
+            distinct_mismatch = check_distinct_name_mismatch(qn_norm, s1n_norm)
+            missing_addr_penalty = 1 if ((m_addr_q ^ m_addr_s1) == 1) else 0
+            
+            feat = {
+                "query_id": qid,
+                "s1_id": s1id,
+                
+                # Retrieval Channels
+                "by_exact_name": getattr(row, "by_exact_name", 0),
+                "by_exact_address": getattr(row, "by_exact_address", 0),
+                "by_exact_combined": getattr(row, "by_exact_combined", 0),
+                "by_bm25_name": getattr(row, "by_bm25_name", 0),
+                "bm25_name_score": getattr(row, "bm25_name_score", 0.0),
+                "bm25_name_rank": getattr(row, "bm25_name_rank", 999),
+                "by_bm25_combined": getattr(row, "by_bm25_combined", 0),
+                "bm25_comb_score": getattr(row, "bm25_comb_score", 0.0),
+                "bm25_comb_rank": getattr(row, "bm25_comb_rank", 999),
+                "by_tfidf_name": getattr(row, "by_tfidf_name", 0),
+                "tfidf_name_score": getattr(row, "tfidf_name_score", 0.0),
+                "tfidf_name_rank": getattr(row, "tfidf_name_rank", 999),
+                "by_tfidf_address": getattr(row, "by_tfidf_address", 0),
+                "tfidf_addr_score": getattr(row, "tfidf_addr_score", 0.0),
+                "tfidf_addr_rank": getattr(row, "tfidf_addr_rank", 999),
+                "retrieval_agreement_count": getattr(row, "retrieval_agreement_count", 0),
+                "best_retrieval_rank": getattr(row, "best_retrieval_rank", 999),
+                "best_reciprocal_rank": getattr(row, "best_reciprocal_rank", 0.0),
+                
+                # Exact Matches
+                "exact_name_raw": ex_name_raw,
+                "exact_name_normalized": ex_name_norm,
+                "exact_addr_raw": ex_addr_raw,
+                "exact_addr_normalized": ex_addr_norm,
+                "exact_combined_normalized": ex_comb_norm,
+                
+                # Name Similarities
+                "name_levenshtein": n_lev,
+                "name_jaro_winkler": n_jw,
+                "name_fuzz_ratio": n_ratio,
+                "name_partial_ratio": n_part,
+                "name_token_sort": n_tsort,
+                "name_token_set": n_tset,
+                "name_char_len_diff": n_diff,
+                "name_char_len_ratio": n_len_ratio,
+                "name_token_overlap": n_overlap,
+                "name_token_count_diff": n_tdiff,
+                "name_translit_lev": n_trans_lev,
+                
+                # Address Similarities
+                "addr_levenshtein": a_lev,
+                "addr_jaro_winkler": a_jw,
+                "addr_fuzz_ratio": a_ratio,
+                "addr_partial_ratio": a_part,
+                "addr_token_sort": a_tsort,
+                "addr_token_set": a_tset,
+                "addr_char_len_diff": a_diff,
+                "addr_char_len_ratio": a_len_ratio,
+                "addr_token_overlap": a_overlap,
+                "addr_token_count_diff": a_tdiff,
+                "addr_translit_lev": a_trans_lev,
+                
+                # Combined
+                "combined_token_set": comb_tset,
+                "weighted_composite_similarity": weighted_sim,
+                
+                # Metadata
+                "country_exact_match": c_match,
+                "country_mismatch": c_mismatch,
+                "country_missing": c_missing,
+                "script_match": script_match,
+                "script_mismatch": script_mismatch,
+                "query_is_s2": is_s2,
+                "missing_name_q": m_name_q,
+                "missing_addr_q": m_addr_q,
+                "missing_name_s1": m_name_s1,
+                "missing_addr_s1": m_addr_s1,
+                
+                # High-Precision Disambiguation Signals
+                "is_acronym_match": is_acronym,
+                "distinct_name_mismatch": distinct_mismatch,
+                "us_state_mismatch": us_state_mismatch,
+                "missing_addr_penalty": missing_addr_penalty,
+            }
+            
+            if s1_to_matches is not None:
+                true_queries = s1_to_matches.get(s1id, set())
+                feat["is_match"] = 1 if qid in true_queries else 0
+                
+            rows.append(feat)
+        return rows
         
-        if s1_to_matches is not None:
-            true_queries = s1_to_matches.get(s1id, set())
-            feat["is_match"] = 1 if qid in true_queries else 0
-            
-        feature_rows.append(feat)
+    if n_workers > 1 and n_tuples >= 2000:
+        chunk_sz = (n_tuples + n_workers - 1) // n_workers
+        slices = [tuples_list[i*chunk_sz : min((i+1)*chunk_sz, n_tuples)] for i in range(n_workers)]
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            parts = list(executor.map(_process_slice, slices))
+        feature_rows = [r for part in parts for r in part]
+    else:
+        feature_rows = _process_slice(tuples_list)
         
     feat_df = pd.DataFrame(feature_rows)
     elapsed = time.time() - start_t

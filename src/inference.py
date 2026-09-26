@@ -45,7 +45,9 @@ def run_chunked_inference(
     abs_threshold: Optional[float] = None,
     margin_threshold: Optional[float] = None,
     chunk_size: Optional[int] = None,
-    max_queries: Optional[int] = None
+    max_queries: Optional[int] = None,
+    k_bm25_comb: Optional[int] = None,
+    k_bm25_name: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Executes streaming chunked inference on test dataset with bounded memory footprint.
@@ -60,6 +62,8 @@ def run_chunked_inference(
         margin_threshold: Frozen optimal margin threshold from validation (loaded if None).
         chunk_size: Number of queries per chunk to stream without exceeding RAM.
         max_queries: Optional limit for testing/debugging.
+        k_bm25_comb: Number of BM25 combined candidates (defaults to 3; set to 0 for Strategy 1).
+        k_bm25_name: Number of BM25 name candidates (defaults to 5).
         
     Returns:
         Summary dictionary of inference metrics.
@@ -75,6 +79,14 @@ def run_chunked_inference(
     if chunk_size is None:
         chunk_size = DEFAULT_CHUNK_SIZE
 
+    if k_bm25_comb is None:
+        env_comb = os.environ.get("BM25_COMB_K")
+        k_bm25_comb = int(env_comb) if env_comb is not None else 3
+        
+    if k_bm25_name is None:
+        env_name = os.environ.get("BM25_NAME_K")
+        k_bm25_name = int(env_name) if env_name is not None else (7 if k_bm25_comb == 0 else 5)
+
     logger.info("=" * 60)
     logger.info("[INFERENCE] STARTING STREAMING DISK-SHARDED INFERENCE PIPELINE")
     logger.info(f"  Test Directory:     {test_dir}")
@@ -82,6 +94,7 @@ def run_chunked_inference(
     logger.info(f"  Margin Threshold:   {margin_threshold:.2f}")
     logger.info(f"  Chunk Size:         {chunk_size:,} queries")
     logger.info(f"  Max Queries:        {max_queries if max_queries else 'ALL'}")
+    logger.info(f"  BM25 Channels:      Name top-{k_bm25_name}, Comb top-{k_bm25_comb}")
     logger.info("=" * 60)
     
     start_t = time.time()
@@ -101,14 +114,10 @@ def run_chunked_inference(
     s1_df = create_normalized_features(s1_df)
     
     # 2. Fit unified CandidateGenerator once on reference S1
-    # Optimized for massive multi-million streaming inference:
-    # Uses BM25 (top-5 name + top-5 combined) and exact match capping, bypassing Char-TFIDF.
-    # Validation proved BM25 achieves 99.96% recall alone, while Char-TFIDF added zero unique matches
-    # and consumed 79% of inference time.
     generator = CandidateGenerator(
         k_exact_cap=15,
-        k_bm25_name=5,
-        k_bm25_comb=3,
+        k_bm25_name=k_bm25_name,
+        k_bm25_comb=k_bm25_comb,
         k_tfidf_name=0,
         k_tfidf_addr=0,
         bm25_max_df=0.25
