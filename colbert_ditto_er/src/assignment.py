@@ -11,22 +11,19 @@ logger = logging.getLogger("ColBERT_Ditto.Assignment")
 
 def apply_assignment_rules(
     query_scores: Dict[str, List[Tuple[str, float]]],
-    all_s1_ids: List[str],
     abs_threshold: float = 0.50,
     margin_threshold: float = 0.05
 ) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
     """
-    Applies decision rules:
-    - Sorts candidate reference entities per query by score descending.
-    - Top candidate must satisfy score >= abs_threshold.
-    - If second candidate exists, (top1 - top2) >= margin_threshold.
-    - Query exclusivity: each query assigned to at most one reference entity.
+    Applies decision rules sparsely for the current chunk.
+    Only returns entities touched by the queries in this chunk, avoiding
+    allocating millions of empty sets per chunk.
     
     Returns:
-      (matches_map, candidates_map) where keys are all S1 IDs.
+      (chunk_matches, chunk_candidates): sparse {s1_id: set(qids)} maps.
     """
-    matches_map: Dict[str, Set[str]] = {s1: set() for s1 in all_s1_ids}
-    candidates_map: Dict[str, Set[str]] = {s1: set() for s1 in all_s1_ids}
+    matches_map: Dict[str, Set[str]] = {}
+    candidates_map: Dict[str, Set[str]] = {}
     
     for qid, scored_cands in query_scores.items():
         if not scored_cands:
@@ -34,8 +31,7 @@ def apply_assignment_rules(
             
         # Register all candidates in candidates_map
         for s1_id, _ in scored_cands:
-            if s1_id in candidates_map:
-                candidates_map[s1_id].add(qid)
+            candidates_map.setdefault(s1_id, set()).add(qid)
                 
         # Sort descending by score
         scored_cands.sort(key=lambda x: x[1], reverse=True)
@@ -52,7 +48,6 @@ def apply_assignment_rules(
                 continue
                 
         # Assign query to top S1
-        if top1_s1 in matches_map:
-            matches_map[top1_s1].add(qid)
+        matches_map.setdefault(top1_s1, set()).add(qid)
             
     return matches_map, candidates_map

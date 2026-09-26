@@ -85,9 +85,9 @@ def optimize_thresholds_grid(
       'query_id', 's1_id', 'score'
     """
     if abs_range is None:
-        abs_range = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+        abs_range = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
     if margin_range is None:
-        margin_range = [0.0, 0.02, 0.05, 0.08, 0.10]
+        margin_range = [0.0, 0.02, 0.05, 0.08, 0.10, 0.15]
         
     logger.info("[EVALUATION] Starting 2D threshold & margin grid optimization...")
     
