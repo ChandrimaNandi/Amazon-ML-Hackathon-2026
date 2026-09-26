@@ -56,6 +56,10 @@ def compute_string_similarities(str1: str, str2: str) -> Tuple[float, float, flo
         t2 = len(str2.split()) if str2 else 0
         return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, diff, ratio, 0, abs(t1 - t2))
         
+    if str1 == str2:
+        tokens = set(str1.split())
+        return (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, 1.0, len(tokens), 0)
+
     l1, l2 = len(str1), len(str2)
     diff = abs(l1 - l2)
     len_ratio = min(l1, l2) / float(max(l1, l2, 1))

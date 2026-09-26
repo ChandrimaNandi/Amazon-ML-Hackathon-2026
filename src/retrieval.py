@@ -78,16 +78,19 @@ class CharTFIDFRetriever:
         self,
         query_texts: List[str],
         top_k: int = 20,
-        batch_size: int = 500
+        batch_size: int = 2000
     ) -> List[List[Tuple[str, float, int]]]:
         """
         Retrieves top_k reference entities for each query text.
         Returns list of [(s1_id, cosine_score, rank), ...] per query.
         """
+        num_queries = len(query_texts)
+        if top_k <= 0 or num_queries == 0:
+            return [[] for _ in range(num_queries)]
+
         if self.corpus_matrix_T is None:
             raise ValueError("Retriever has not been fitted.")
             
-        num_queries = len(query_texts)
         results: List[List[Tuple[str, float, int]]] = []
         start_t = time.time()
         
@@ -143,16 +146,19 @@ class SparseBM25Retriever:
         k1: float = 1.5,
         b: float = 0.75,
         max_features: int = 100000,
-        min_df: int = 1
+        min_df: int = 1,
+        max_df: float = 0.3
     ):
         self.k1 = k1
         self.b = b
         self.max_features = max_features
         self.min_df = min_df
+        self.max_df = max_df
         self.vectorizer = CountVectorizer(
             token_pattern=r"(?u)\b\w+\b",
             max_features=max_features,
             min_df=min_df,
+            max_df=max_df if max_df < 1.0 else 1.0,
             dtype=np.float32
         )
         self.bm25_matrix_T: csr_matrix = None
@@ -164,7 +170,22 @@ class SparseBM25Retriever:
         logger.info(f"[RETRIEVAL] Fitting Sparse BM25 (k1={self.k1}, b={self.b}) on {len(corpus_texts):,} reference texts...")
         
         # Word count matrix: (N, V)
-        X = self.vectorizer.fit_transform(corpus_texts)
+        try:
+            X = self.vectorizer.fit_transform(corpus_texts)
+        except ValueError as e:
+            if "empty vocabulary" in str(e) and self.max_df < 1.0:
+                logger.warning("[RETRIEVAL] max_df resulted in empty vocabulary; falling back to max_df=1.0")
+                self.vectorizer = CountVectorizer(
+                    token_pattern=r"(?u)\b\w+\b",
+                    max_features=self.max_features,
+                    min_df=self.min_df,
+                    max_df=1.0,
+                    dtype=np.float32
+                )
+                X = self.vectorizer.fit_transform(corpus_texts)
+            else:
+                raise e
+                
         N, V = X.shape
         
         # Document frequencies per term
@@ -198,16 +219,19 @@ class SparseBM25Retriever:
         self,
         query_texts: List[str],
         top_k: int = 20,
-        batch_size: int = 500
+        batch_size: int = 2000
     ) -> List[List[Tuple[str, float, int]]]:
         """
         Retrieves top_k reference entities for each query text using BM25 scoring.
         Returns list of [(s1_id, bm25_score, rank), ...] per query.
         """
+        num_queries = len(query_texts)
+        if top_k <= 0 or num_queries == 0:
+            return [[] for _ in range(num_queries)]
+
         if self.bm25_matrix_T is None:
             raise ValueError("Retriever has not been fitted.")
             
-        num_queries = len(query_texts)
         results: List[List[Tuple[str, float, int]]] = []
         start_t = time.time()
         
