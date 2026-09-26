@@ -136,19 +136,23 @@ class CharTFIDFRetriever:
 
 
 BUSINESS_STOP_WORDS = [
-    # Corporate entity suffixes & abbreviations
+    # Corporate entity suffixes & abbreviations (US, India, UK, Germany, France)
     "limited", "private", "ltd", "pvt", "llc", "inc", "corp", "corporation",
     "company", "co", "enterprises", "enterprise", "group", "holdings", "holding",
     "partners", "associates", "industries", "industry", "ventures", "venture",
     "solutions", "services", "service", "international", "intl", "llp", "plc",
     "gmbh", "sa", "srl", "bv", "ag",
-    # Common address designators & noise
+    # French corporate suffixes
+    "sarl", "sas", "sasu", "eurl", "sci", "snc", "ste", "societe", "amicale", "club",
+    # Common address designators & noise (English & French)
     "street", "st", "road", "rd", "avenue", "ave", "lane", "ln", "drive", "dr",
     "suite", "ste", "floor", "fl", "building", "bldg", "near", "opp", "opposite",
     "post", "box", "po", "highway", "hwy", "block", "blk", "sector", "sec",
     "plot", "shop", "flat", "room", "no", "unit",
-    # Common English prepositions & conjunctions
-    "the", "and", "of", "in", "for", "at", "by", "to", "on", "from", "with"
+    "rue", "boulevard", "bd", "blvd", "chemin", "route", "rte", "impasse", "allee", "place", "cedex",
+    # Common English & French prepositions / conjunctions / articles
+    "the", "and", "of", "in", "for", "at", "by", "to", "on", "from", "with",
+    "de", "du", "des", "la", "le", "les", "et", "en", "d"
 ]
 
 
