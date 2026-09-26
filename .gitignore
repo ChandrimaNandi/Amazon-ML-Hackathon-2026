@@ -24,4 +24,5 @@ output/
 # OS
 .DS_Store
 
-fast_hybrid_er/*
+fast_hybrid_er/results/*.pkl
+
