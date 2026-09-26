@@ -41,10 +41,11 @@ class SubwordCharEmbeddingNet(nn.Module if HAS_TORCH else object):
     def forward(self, ngram_indices: "torch.Tensor", lengths: "torch.Tensor") -> "torch.Tensor":
         # ngram_indices: (batch_size, max_seq_len)
         emb = self.embedding(ngram_indices)  # (batch_size, seq_len, embed_dim)
-        # Masked average pooling
-        mask = (ngram_indices != 0).unsqueeze(-1).float()
+        dtype = emb.dtype
+        # Masked average pooling matching model dtype (FP16/FP32)
+        mask = (ngram_indices != 0).unsqueeze(-1).to(dtype)
         summed = torch.sum(emb * mask, dim=1)
-        denom = torch.clamp(lengths.unsqueeze(-1).float(), min=1.0)
+        denom = torch.clamp(lengths.unsqueeze(-1).to(dtype), min=1.0)
         pooled = summed / denom
         proj = self.fc(pooled)
         normed = self.layer_norm(proj)
