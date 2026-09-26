@@ -74,12 +74,17 @@ def discover_dataset_paths() -> Tuple[Path, Path]:
     """
     Dynamically discovers training and test directories across Kaggle and local workspace.
     Checks:
-    1. /kaggle/input/amazon-ml-hackathon-2026/dataset/
-    2. /kaggle/input/amazon-ml-challenge-2026/
-    3. /kaggle/input/student-resource/dataset/
-    4. ./dataset (local repo root)
+    1. /kaggle/input/datasets/chandrimanandi/entity-data/dataset
+    2. /kaggle/input/entity-data/dataset
+    3. /kaggle/input/amazon-ml-hackathon-2026/dataset/
+    4. Recursive scan under /kaggle/input
+    5. Local workspace ./dataset
     """
     candidate_train_dirs = [
+        Path("/kaggle/input/datasets/chandrimanandi/entity-data/dataset/train"),
+        Path("/kaggle/input/datasets/chandrimanandi/entity-data/train"),
+        Path("/kaggle/input/entity-data/dataset/train"),
+        Path("/kaggle/input/entity-data/train"),
         Path("/kaggle/input/amazon-ml-hackathon-2026/dataset/train"),
         Path("/kaggle/input/amazon-ml-challenge-2026/dataset/train"),
         Path("/kaggle/input/student-resource/dataset/train"),
@@ -90,6 +95,10 @@ def discover_dataset_paths() -> Tuple[Path, Path]:
     ]
     
     candidate_test_dirs = [
+        Path("/kaggle/input/datasets/chandrimanandi/entity-data/dataset/test"),
+        Path("/kaggle/input/datasets/chandrimanandi/entity-data/test"),
+        Path("/kaggle/input/entity-data/dataset/test"),
+        Path("/kaggle/input/entity-data/test"),
         Path("/kaggle/input/amazon-ml-hackathon-2026/dataset/test"),
         Path("/kaggle/input/amazon-ml-challenge-2026/dataset/test"),
         Path("/kaggle/input/student-resource/dataset/test"),
@@ -101,21 +110,36 @@ def discover_dataset_paths() -> Tuple[Path, Path]:
     
     train_dir = None
     for p in candidate_train_dirs:
-        if p.exists() and (p / "train_source1.tsv").exists():
+        if p.exists() and (p / "train_ground_truth.tsv").exists():
             train_dir = p.resolve()
             break
             
+    # Recursive search under /kaggle/input if not found yet
+    if train_dir is None and Path("/kaggle/input").is_dir():
+        for root, dirs, files in os.walk("/kaggle/input"):
+            if "train_ground_truth.tsv" in files or any("ground_truth" in f for f in files):
+                train_dir = Path(root).resolve()
+                break
+                
     test_dir = None
     for p in candidate_test_dirs:
         if p.exists() and (p / "test_source1.tsv").exists():
             test_dir = p.resolve()
             break
             
+    if test_dir is None and Path("/kaggle/input").is_dir():
+        for root, dirs, files in os.walk("/kaggle/input"):
+            if "test_source1.tsv" in files or any("test_source" in f for f in files):
+                test_dir = Path(root).resolve()
+                break
+                
     if train_dir is None:
         train_dir = (PROJECT_ROOT / "dataset" / "train").resolve()
     if test_dir is None:
         test_dir = (PROJECT_ROOT / "dataset" / "test").resolve()
         
+    logger.info(f"[CONFIG] Discovered Train Directory: {train_dir}")
+    logger.info(f"[CONFIG] Discovered Test Directory:  {test_dir}")
     return train_dir, test_dir
 
 

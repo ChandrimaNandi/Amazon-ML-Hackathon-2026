@@ -85,6 +85,15 @@ def discover_dataset_paths(base_hint: Optional[Path] = None) -> Dict[str, Path]:
     search_roots = []
     if base_hint and Path(base_hint).exists():
         search_roots.append(Path(base_hint))
+    user_hints = [
+        Path("/kaggle/input/datasets/chandrimanandi/entity-data/dataset"),
+        Path("/kaggle/input/datasets/chandrimanandi/entity-data"),
+        Path("/kaggle/input/entity-data/dataset"),
+        Path("/kaggle/input/entity-data"),
+    ]
+    for h in user_hints:
+        if h.exists():
+            search_roots.append(h)
     if Path("/kaggle/input").exists():
         search_roots.append(Path("/kaggle/input"))
     search_roots.append(PROJECT_ROOT)
