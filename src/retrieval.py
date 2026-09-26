@@ -135,6 +135,23 @@ class CharTFIDFRetriever:
         return results
 
 
+BUSINESS_STOP_WORDS = [
+    # Corporate entity suffixes & abbreviations
+    "limited", "private", "ltd", "pvt", "llc", "inc", "corp", "corporation",
+    "company", "co", "enterprises", "enterprise", "group", "holdings", "holding",
+    "partners", "associates", "industries", "industry", "ventures", "venture",
+    "solutions", "services", "service", "international", "intl", "llp", "plc",
+    "gmbh", "sa", "srl", "bv", "ag",
+    # Common address designators & noise
+    "street", "st", "road", "rd", "avenue", "ave", "lane", "ln", "drive", "dr",
+    "suite", "ste", "floor", "fl", "building", "bldg", "near", "opp", "opposite",
+    "post", "box", "po", "highway", "hwy", "block", "blk", "sector", "sec",
+    "plot", "shop", "flat", "room", "no", "unit",
+    # Common English prepositions & conjunctions
+    "the", "and", "of", "in", "for", "at", "by", "to", "on", "from", "with"
+]
+
+
 class SparseBM25Retriever:
     """
     Fast BM25 inverted-index retriever using sparse matrix dot products.
@@ -147,18 +164,21 @@ class SparseBM25Retriever:
         b: float = 0.75,
         max_features: int = 100000,
         min_df: int = 1,
-        max_df: float = 0.3
+        max_df: float = 0.25,
+        stop_words: Optional[List[str]] = None
     ):
         self.k1 = k1
         self.b = b
         self.max_features = max_features
         self.min_df = min_df
         self.max_df = max_df
+        self.stop_words = list(BUSINESS_STOP_WORDS) if stop_words is None else stop_words
         self.vectorizer = CountVectorizer(
             token_pattern=r"(?u)\b\w+\b",
             max_features=max_features,
             min_df=min_df,
             max_df=max_df if max_df < 1.0 else 1.0,
+            stop_words=self.stop_words,
             dtype=np.float32
         )
         self.bm25_matrix_T: csr_matrix = None
@@ -173,13 +193,14 @@ class SparseBM25Retriever:
         try:
             X = self.vectorizer.fit_transform(corpus_texts)
         except ValueError as e:
-            if "empty vocabulary" in str(e) and self.max_df < 1.0:
-                logger.warning("[RETRIEVAL] max_df resulted in empty vocabulary; falling back to max_df=1.0")
+            if "empty vocabulary" in str(e):
+                logger.warning("[RETRIEVAL] max_df/stop_words resulted in empty vocabulary; falling back to basic vectorizer")
                 self.vectorizer = CountVectorizer(
                     token_pattern=r"(?u)\b\w+\b",
                     max_features=self.max_features,
                     min_df=self.min_df,
                     max_df=1.0,
+                    stop_words=None,
                     dtype=np.float32
                 )
                 X = self.vectorizer.fit_transform(corpus_texts)
@@ -261,6 +282,26 @@ class SparseBM25Retriever:
                 
                 if len(data) <= top_k:
                     order = np.argsort(-data)
+                elif len(data) > 2000:
+                    # When candidate list is large, threshold to candidates with score > 0.2
+                    # to keep argpartition fast and avoid multi-second pure-Python bottlenecks
+                    mask = data > 0.2
+                    if np.count_nonzero(mask) >= top_k:
+                        sub_data = data[mask]
+                        sub_indices = indices[mask]
+                        part = np.argpartition(sub_data, -top_k)[-top_k:]
+                        order = part[np.argsort(-sub_data[part])]
+                        row_cands = []
+                        for rank, j in enumerate(order, start=1):
+                            sc = float(sub_data[j])
+                            if sc <= 0.001:
+                                break
+                            row_cands.append((self.s1_ids[sub_indices[j]], sc, rank))
+                        results.append(row_cands)
+                        continue
+                    else:
+                        part = np.argpartition(data, -top_k)[-top_k:]
+                        order = part[np.argsort(-data[part])]
                 else:
                     part = np.argpartition(data, -top_k)[-top_k:]
                     order = part[np.argsort(-data[part])]

@@ -43,7 +43,8 @@ class CandidateGenerator:
         k_tfidf_name: int = 15,
         k_tfidf_addr: int = 10,
         max_features: int = 100000,
-        bm25_max_df: float = 0.3
+        bm25_max_df: float = 0.25,
+        bm25_stop_words: Optional[List[str]] = None
     ):
         self.k_exact_cap = k_exact_cap
         self.k_bm25_name = k_bm25_name
@@ -56,8 +57,8 @@ class CandidateGenerator:
         self.exact_addr = ExactMatchIndex(max_bucket_size=k_exact_cap)
         self.exact_comb = ExactMatchIndex(max_bucket_size=k_exact_cap)
         
-        self.bm25_name = SparseBM25Retriever(max_features=max_features, max_df=bm25_max_df)
-        self.bm25_comb = SparseBM25Retriever(max_features=max_features, max_df=bm25_max_df)
+        self.bm25_name = SparseBM25Retriever(max_features=max_features, max_df=bm25_max_df, stop_words=bm25_stop_words)
+        self.bm25_comb = SparseBM25Retriever(max_features=max_features, max_df=bm25_max_df, stop_words=bm25_stop_words)
         
         self.tfidf_name = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features, min_df=2)
         self.tfidf_addr = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features, min_df=2)

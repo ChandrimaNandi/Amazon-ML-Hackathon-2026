@@ -108,10 +108,10 @@ def run_chunked_inference(
     generator = CandidateGenerator(
         k_exact_cap=15,
         k_bm25_name=5,
-        k_bm25_comb=5,
+        k_bm25_comb=3,
         k_tfidf_name=0,
         k_tfidf_addr=0,
-        bm25_max_df=0.3
+        bm25_max_df=0.25
     )
     generator.fit(s1_df)
     if "combined_normalized" in s1_df.columns:
