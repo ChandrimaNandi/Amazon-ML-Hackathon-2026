@@ -249,17 +249,17 @@ def get_optimal_batch_and_chunk_sizes() -> Tuple[int, int]:
     n_gpus = hw["gpu_count"]
 
     if n_gpus >= 2 and avail_ram >= 12.0:
-        chunk_size = 50000
-        batch_size = 10000
+        chunk_size = 25000
+        batch_size = 1000
     elif n_gpus == 1 and avail_ram >= 10.0:
-        chunk_size = 40000
-        batch_size = 8000
-    elif avail_ram >= 10.0:
-        chunk_size = 30000
-        batch_size = 5000
-    else:
         chunk_size = 20000
-        batch_size = 4000
+        batch_size = 1000
+    elif avail_ram >= 10.0:
+        chunk_size = 15000
+        batch_size = 500
+    else:
+        chunk_size = 10000
+        batch_size = 500
 
     if env_chunk:
         chunk_size = int(env_chunk)

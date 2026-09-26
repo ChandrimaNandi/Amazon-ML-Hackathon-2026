@@ -109,6 +109,9 @@ def run_chunked_inference(
         k_tfidf_addr=10
     )
     generator.fit(s1_df)
+    if "combined_normalized" in s1_df.columns:
+        del s1_df["combined_normalized"]
+    release_memory()
     
     # 3. Setup Disk-Sharded Candidate & Prediction Streaming
     # Shard reference entities to guarantee O(1) RAM regardless of query count

@@ -78,7 +78,7 @@ class CharTFIDFRetriever:
         self,
         query_texts: List[str],
         top_k: int = 20,
-        batch_size: int = 5000
+        batch_size: int = 500
     ) -> List[List[Tuple[str, float, int]]]:
         """
         Retrieves top_k reference entities for each query text.
@@ -198,7 +198,7 @@ class SparseBM25Retriever:
         self,
         query_texts: List[str],
         top_k: int = 20,
-        batch_size: int = 5000
+        batch_size: int = 500
     ) -> List[List[Tuple[str, float, int]]]:
         """
         Retrieves top_k reference entities for each query text using BM25 scoring.

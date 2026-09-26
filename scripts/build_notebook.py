@@ -4,29 +4,9 @@ Includes self-contained extraction for fresh Kaggle sessions and dual NVIDIA T4 
 """
 
 import json
-import io
-import tarfile
-import base64
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-
-def get_codebase_bundle_b64() -> str:
-    """Creates a compact in-memory base64 tar.gz bundle of src/ and utils/."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.add(
-            PROJECT_ROOT / "src",
-            arcname="src",
-            filter=lambda ti: None if "__pycache__" in ti.name or ti.name.endswith(".pyc") else ti
-        )
-        tar.add(
-            PROJECT_ROOT / "utils",
-            arcname="utils",
-            filter=lambda ti: None if "__pycache__" in ti.name or ti.name.endswith(".pyc") else ti
-        )
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def create_notebook():
@@ -133,36 +113,62 @@ S1 Reference Entities (Deduplicated)               S2 / S3 Noisy Query Records
 ```
 """)
 
-    # 1. Configuration & Standalone Unpacker
-    add_md("""## 1. Environment Discovery & Self-Contained Bootstrap
-Centralized hardware discovery and configuration. Supports both local development and a completely fresh Kaggle session (including auto-extracting embedded codebase if run as a standalone notebook).""")
-    
-    codebase_b64 = get_codebase_bundle_b64()
+    # 1. Environment Discovery & GitHub Codebase Synchronization
+    add_md("""## 1. Environment Discovery & Codebase Synchronization
+Centralized hardware discovery and configuration. Automatically syncs and updates the repository from GitHub (https://github.com/ChandrimaNandi/Amazon-ML-Hackathon-2026.git) when running in remote environments like Kaggle or Google Colab.""")
     
     cell1_code = """import os
 import sys
-import io
-import base64
-import tarfile
+import subprocess
 from pathlib import Path
 
-# Standalone Kaggle session auto-bootstrap:
-# If 'src' directory does not exist on disk, self-extract embedded bundle
-if not ((Path.cwd() / "src").exists() or (Path.cwd().parent / "src").exists()):
-    print("[STANDALONE BOOTSTRAP] 'src' directory not found. Unpacking self-contained codebase...")
-    _bundle_data = b'''__CODEBASE_BUNDLE_B64__'''
-    _buf = io.BytesIO(base64.b64decode(_bundle_data))
-    with tarfile.open(fileobj=_buf, mode="r:gz") as _tar:
-        _tar.extractall(path=Path.cwd())
-    print("[STANDALONE BOOTSTRAP] Successfully unpacked 'src' and 'utils' to current workspace.")
+REPO_URL = "https://github.com/ChandrimaNandi/Amazon-ML-Hackathon-2026.git"
+REPO_NAME = "Amazon-ML-Hackathon-2026"
 
-# Auto-detect project root and add to sys.path
-PROJECT_ROOT = Path(os.getcwd()).resolve()
-if (PROJECT_ROOT / "src").exists():
-    sys.path.insert(0, str(PROJECT_ROOT))
-elif (PROJECT_ROOT.parent / "src").exists():
-    sys.path.insert(0, str(PROJECT_ROOT.parent))
-    PROJECT_ROOT = PROJECT_ROOT.parent
+# Check if current directory or any parent is already the repository root
+def find_project_root():
+    candidates = [
+        Path.cwd(),
+        Path.cwd().parent,
+        Path("/kaggle/working") if Path("/kaggle/working").exists() else None,
+        (Path("/kaggle/working") / REPO_NAME) if Path("/kaggle/working").exists() else None,
+        Path.cwd() / REPO_NAME,
+    ]
+    candidates.extend(Path.cwd().parents)
+    for p in candidates:
+        if p and p.is_dir() and (p / "src" / "config.py").is_file():
+            return p.resolve()
+    return None
+
+PROJECT_ROOT = find_project_root()
+
+# If not running inside the repository, clone or update from GitHub
+if PROJECT_ROOT is None:
+    target_dir = Path("/kaggle/working" if Path("/kaggle/working").is_dir() else Path.cwd()) / REPO_NAME
+    if not (target_dir / "src" / "config.py").is_file():
+        print(f"[GITHUB] Cloning repository from {REPO_URL} into {target_dir}...")
+        subprocess.run(["git", "clone", REPO_URL, str(target_dir)], check=True)
+    else:
+        print(f"[GITHUB] Repository exists at {target_dir}. Pulling latest updates...")
+        try:
+            subprocess.run(["git", "-C", str(target_dir), "pull"], check=False)
+        except Exception as e:
+            print(f"[GITHUB] Pull warning: {e}")
+    PROJECT_ROOT = target_dir.resolve()
+else:
+    # If already inside git repo, pull latest updates if possible
+    if (PROJECT_ROOT / ".git").is_dir():
+        print(f"[GITHUB] Updating repository at {PROJECT_ROOT}...")
+        try:
+            subprocess.run(["git", "-C", str(PROJECT_ROOT), "pull"], check=False)
+        except Exception as e:
+            print(f"[GITHUB] Pull warning: {e}")
+
+# Ensure project root is at the very beginning of sys.path
+root_str = str(PROJECT_ROOT)
+if root_str in sys.path:
+    sys.path.remove(root_str)
+sys.path.insert(0, root_str)
 
 from src.config import (
     TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GROUND_TRUTH_PATH,
@@ -189,7 +195,7 @@ print(f"  Random Seed:  {RANDOM_SEED}")
 print(f"  Evaluation Beta: {BETA} (Macro F{BETA})")
 print(f"  Streaming Chunk Size:    {DEFAULT_CHUNK_SIZE:,}")
 print(f"  Retrieval Batch Size:   {DEFAULT_RETRIEVAL_BATCH:,}")
-""".replace("__CODEBASE_BUNDLE_B64__", codebase_b64)
+"""
     add_code(cell1_code)
 
     # 2. Imports

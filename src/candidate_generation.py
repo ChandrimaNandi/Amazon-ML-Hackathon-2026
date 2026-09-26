@@ -58,8 +58,8 @@ class CandidateGenerator:
         self.bm25_name = SparseBM25Retriever(max_features=max_features)
         self.bm25_comb = SparseBM25Retriever(max_features=max_features)
         
-        self.tfidf_name = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features)
-        self.tfidf_addr = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features)
+        self.tfidf_name = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features, min_df=2)
+        self.tfidf_addr = CharTFIDFRetriever(ngram_range=(3, 5), max_features=max_features, min_df=2)
         
         self.is_fitted = False
         self.s1_ids: List[str] = []
@@ -107,7 +107,7 @@ class CandidateGenerator:
     def generate_candidates(
         self,
         query_df: pd.DataFrame,
-        batch_size: int = 5000
+        batch_size: int = 500
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
         Generates candidate pairs for query_df against fitted S1 corpus with country hard-blocking.
