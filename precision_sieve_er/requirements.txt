@@ -1,0 +1,11 @@
+# Precision-Sieve Entity Resolution Requirements
+# Compatible with Kaggle Free Tier (Python 3.10+, 2x T4 GPU, 30 GB RAM)
+numpy>=1.23.0
+pandas>=1.5.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+rapidfuzz>=3.0.0
+lightgbm>=3.3.0
+catboost>=1.2.0
+xgboost>=1.7.0
+psutil>=5.9.0
